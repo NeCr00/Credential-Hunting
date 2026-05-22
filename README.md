@@ -101,15 +101,3 @@ Total hits: 30   Files scanned: 13
 | `-h, --help` | `-Help` / `-h` | Show help |
 
 Both modes auto-skip: build / cache / vendor noise (`.git`, `node_modules`, `__pycache__`, `WinSxS`, `WindowsApps`, `$Recycle.Bin`, …), files over the size cap, and binary files (NUL-byte heuristic with BOM awareness on Windows so UTF-16 LE `.ps1` files aren't dropped).
-
-## Ethics
-
-> **Authorized testing only.**
-
-Designed for penetration testers, red-teamers, defenders auditing their own infrastructure, CTF / OSCP / HTB lab work, and IR triage. Don't run this against systems you don't have explicit permission to assess.
-
-Defender / EDR products will flag the PowerShell variant as suspicious — it grep-walks `cpassword`, `-AsPlainText`, SSH keys, and other tradecraft markers. On in-scope lab hosts, add an exclusion or invoke in a permitted context.
-
-## License
-
-MIT.
