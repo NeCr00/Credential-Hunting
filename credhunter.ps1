@@ -5,8 +5,17 @@
   Hardcoded-credential hunter for authorized internal pentesting.
   Spec: docs/specs/2026-05-24-credhunter-design.md
   Authorized use only.
+
+  Secrets are emitted plaintext in console output, findings.txt, and
+  findings.jsonl (match_redacted equals match_text). The -ShowSecrets
+  switch is accepted for backward compatibility but is a no-op. Clean
+  up the output directory after the engagement.
 .PARAMETER Output
-  console | file | both (default: both)
+  console | file | both (default: both). 'console' suppresses all file
+  output (findings.txt / findings.jsonl); 'file' suppresses console
+  rendering; 'both' writes everywhere.
+.PARAMETER ShowSecrets
+  Deprecated. Always-on. Findings are unredacted by design.
 #>
 [CmdletBinding(PositionalBinding=$false)]
 param(
@@ -106,11 +115,58 @@ foreach ($p in @($script:FindJsonl, $script:FindTxt, $script:SkippedLog)) {
     Set-Content -LiteralPath $p -Value '' -NoNewline -Force
 }
 
+# Write-Progress wrappers, suppressed under -Quiet.
+$script:ProgressEnabled = -not $Quiet
+function Write-PhaseProgress {
+    param(
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][string]$Status,
+        [int]$Current = 0,
+        [int]$Total = 0
+    )
+    if (-not $script:ProgressEnabled) { return }
+    $pct = -1
+    if ($Total -gt 0) {
+        $pct = [int](100 * $Current / $Total)
+        if ($pct -lt 0) { $pct = 0 } elseif ($pct -gt 100) { $pct = 100 }
+    }
+    $opp = $ProgressPreference
+    $ProgressPreference = 'Continue'
+    Write-Progress -Id 1 -Activity ("Phase {0}" -f $Phase) -Status $Status -PercentComplete $pct
+    $ProgressPreference = $opp
+}
+function Complete-PhaseProgress {
+    param([string]$Phase = '')
+    if (-not $script:ProgressEnabled) { return }
+    $opp = $ProgressPreference
+    $ProgressPreference = 'Continue'
+    Write-Progress -Id 1 -Activity ("Phase {0}" -f $Phase) -Completed
+    $ProgressPreference = $opp
+}
+
 $script:Findings = New-Object System.Collections.Generic.List[hashtable]
-$script:DedupSet = New-Object System.Collections.Generic.HashSet[string]
+$script:SeenDedup = [System.Collections.Generic.HashSet[string]]::new()
 $script:SeenInodes = New-Object System.Collections.Generic.HashSet[string]
 $script:SkippedCounts = @{ size=0; binary=0; perm=0; excluded=0 }
 $script:ScannedCount = 0
+$script:DupSuppressed = 0
+
+# Output buffers: appended once per phase to avoid mutex-per-write hot path.
+$script:JsonlBuf   = New-Object System.Collections.Generic.List[string]
+$script:TxtBuf     = New-Object System.Collections.Generic.List[string]
+$script:SkippedBuf = New-Object System.Collections.Generic.List[string]
+
+# Compiled-regex cache: every call site uses Get-Rx to avoid recompiling.
+$script:RxCache = @{}
+function Get-Rx {
+    param([string]$Pattern, [System.Text.RegularExpressions.RegexOptions]$Options = 'None')
+    $k = "$Pattern|$($Options.value__)"
+    $rx = $script:RxCache[$k]
+    if ($rx) { return $rx }
+    $rx = [regex]::new($Pattern, ($Options -bor [System.Text.RegularExpressions.RegexOptions]::Compiled))
+    $script:RxCache[$k] = $rx
+    return $rx
+}
 
 if ($script:IsWindowsHost) {
     try {
@@ -352,7 +408,18 @@ function Test-Excluded {
 }
 
 function Test-Binary {
+    # Treat OneDrive placeholders / reparse points as binary so the content
+    # path skips them — this is the defensive belt to Get-CandidateFiles's
+    # braces. Avoids triggering a network download on Open().
     param([string]$Path)
+    try {
+        $fi = [System.IO.FileInfo]::new($Path)
+        if ($fi.Exists) {
+            $attrInt = [int]$fi.Attributes
+            if (($attrInt -band 0x441400) -ne 0) { return $true }
+            if ((-not $FollowSymlinks) -and (($attrInt -band 0x400) -ne 0)) { return $true }
+        }
+    } catch {}
     try {
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
     } catch { return $true }
@@ -402,15 +469,42 @@ function Read-TextFile {
     }
 }
 
+function Get-LineStarts {
+    # Build (and cache) the array of byte offsets where each line begins:
+    # arr[0]=0, arr[i] = offset just after the i'th '\n'. Cached on the
+    # string identity (HashCode + Length) so repeat callers for the same
+    # file body skip the O(n) build. Per-match line lookup is then an
+    # O(log n) binary search.
+    param([string]$Content)
+    if ($null -eq $script:LineStartsCache) { $script:LineStartsCache = @{} }
+    if (-not $Content) { return @(0) }
+    $key = "{0}:{1}" -f $Content.Length, [System.String]::Intern($Content).GetHashCode()
+    $cached = $script:LineStartsCache[$key]
+    if ($cached) { return $cached }
+    $starts = New-Object System.Collections.Generic.List[int]
+    $starts.Add(0)
+    $i = 0
+    while (($i = $Content.IndexOf("`n", $i)) -ge 0) {
+        $starts.Add($i + 1)
+        $i++
+    }
+    $arr = $starts.ToArray()
+    $script:LineStartsCache[$key] = $arr
+    return $arr
+}
+
 function Get-LineNumber {
+    # O(log n) via binary search over the cached line-starts index.
+    # The naive per-match newline count was the dominant cost on big
+    # log files (462 KB / 15k lines → 100 ms PER call).
     param([string]$Content, [int]$Offset)
     if ($Offset -le 0 -or -not $Content) { return 1 }
-    $slice = $Content.Substring(0, [Math]::Min($Offset, $Content.Length))
-    $count = 1
-    for ($i = 0; $i -lt $slice.Length; $i++) {
-        if ($slice[$i] -eq "`n") { $count++ }
-    }
-    return $count
+    if ($Offset -gt $Content.Length) { $Offset = $Content.Length }
+    $arr = Get-LineStarts $Content
+    $idx = [Array]::BinarySearch($arr, [int]$Offset)
+    if ($idx -lt 0) { $idx = -($idx + 1) - 1 }
+    if ($idx -lt 0) { $idx = 0 }
+    return $idx + 1
 }
 
 function Get-LineText {
@@ -529,12 +623,12 @@ function Convert-EntropyDemotion {
 }
 
 function Format-Redacted {
+    # Redaction intentionally disabled in this build; -ShowSecrets is a no-op
+    # kept for backward-compat. All findings emit plaintext in findings.txt
+    # and findings.jsonl (match_redacted is always equal to match_text).
     param([string]$S)
-    if ($ShowSecrets) { return $S }
-    if ([string]::IsNullOrEmpty($S)) { return '' }
-    if ($S.Length -le 4) { return '****' }
-    $stars = '*' * ($S.Length - 4)
-    return ($S.Substring(0, 2) + $stars + $S.Substring($S.Length - 2, 2))
+    if ($null -eq $S) { return '' }
+    return $S
 }
 
 function Get-DedupKey {
@@ -548,25 +642,35 @@ function Get-DedupKey {
     } finally { $sha.Dispose() }
 }
 
+$script:FileMetaCache = @{}
 function Get-FileMetadata {
+    # Cached per abs_path. Phase 5 records many findings per file; the
+    # uncached version called Get-Item + Get-Acl per finding (3-4 IO ops
+    # each) which dominated walltime when finding density was high.
     param([string]$Path)
+    if (-not $Path) { return @{ mtime=''; size=0; mode=''; owner='' } }
+    $cached = $script:FileMetaCache[$Path]
+    if ($cached) { return $cached }
     $meta = @{ mtime=''; size=0; mode=''; owner='' }
     try {
-        if ($Path -and (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-            $it = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-            if ($it) {
-                $meta.mtime = $it.LastWriteTimeUtc.ToString('o')
-                if ($it -is [System.IO.FileInfo]) { $meta.size = $it.Length }
-                $meta.mode = $it.Mode
-                if ($script:IsWindowsHost) {
-                    try {
-                        $acl = Get-Acl -LiteralPath $Path -ErrorAction SilentlyContinue
-                        if ($acl) { $meta.owner = $acl.Owner }
-                    } catch {}
-                }
+        $it = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($it) {
+            $meta.mtime = $it.LastWriteTimeUtc.ToString('o')
+            if ($it -is [System.IO.FileInfo]) { $meta.size = $it.Length }
+            $meta.mode = $it.Mode
+            # ACL owner lookup is the most expensive piece — skip on
+            # macOS/Linux where Get-Acl errors anyway, and skip altogether
+            # when we don't have a Windows file path (e.g. registry pseudo
+            # paths like "HKLM:\...::ValueName").
+            if ($script:IsWindowsHost -and $Path -notmatch '::') {
+                try {
+                    $acl = Get-Acl -LiteralPath $Path -ErrorAction SilentlyContinue
+                    if ($acl) { $meta.owner = $acl.Owner }
+                } catch {}
             }
         }
     } catch {}
+    $script:FileMetaCache[$Path] = $meta
     return $meta
 }
 
@@ -585,14 +689,19 @@ function Add-Finding {
     $minRank = @{ 'LOW'=0; 'MEDIUM'=1; 'HIGH'=2 }
     if ($minRank[$F.confidence] -lt $minRank[$MinConfidence]) { return }
 
+    # Cross-phase dedup: compute key early; suppress duplicates so the
+    # in-memory buffer never contains two records with the same dedup_key.
     $dedup = Get-DedupKey -RuleId $F.rule_id -Path $F.abs_path -LineNo $F.line_no -Match $F.match_text
-    if (-not $script:DedupSet.Add($dedup)) { return }
+    if ($script:SeenDedup.Contains($dedup)) { $script:DupSuppressed++; return }
+    [void]$script:SeenDedup.Add($dedup)
 
     $F.dedup_key      = $dedup
     $F.host           = $script:HOSTN
     $F.scan_user      = $script:CurrentUser
     $F.scan_user_priv = $script:Priv
-    $F.match_redacted = Format-Redacted $F.match_text
+    # Secrets are emitted plaintext; match_redacted retained as alias of
+    # match_text for schema compatibility with the spec finding record.
+    $F.match_redacted = $F.match_text
 
     $meta = Get-FileMetadata $F.abs_path
     $F.file_mtime = $meta.mtime
@@ -603,33 +712,135 @@ function Add-Finding {
     $script:Findings.Add($F)
 }
 
-function Save-Finding {
+function Convert-JsonString {
+    # Hand-rolled JSON string escape (RFC 8259 minimum set). PowerShell's
+    # ConvertTo-Json invokes a reflective serializer (~50 ms/call) so the
+    # per-finding path uses this instead and assembles JSON object text
+    # by hand. Returns a quoted JSON string literal.
+    param([AllowNull()][string]$S)
+    if ([string]::IsNullOrEmpty($S)) { return '""' }
+    $sb = New-Object System.Text.StringBuilder ($S.Length + 2)
+    [void]$sb.Append('"')
+    foreach ($c in $S.ToCharArray()) {
+        $i = [int]$c
+        switch ($i) {
+            0x22 { [void]$sb.Append('\"') ; continue }
+            0x5C { [void]$sb.Append('\\') ; continue }
+            0x08 { [void]$sb.Append('\b') ; continue }
+            0x09 { [void]$sb.Append('\t') ; continue }
+            0x0A { [void]$sb.Append('\n') ; continue }
+            0x0C { [void]$sb.Append('\f') ; continue }
+            0x0D { [void]$sb.Append('\r') ; continue }
+            default {
+                if ($i -lt 0x20) {
+                    [void]$sb.AppendFormat('\u{0:x4}', $i)
+                } else {
+                    [void]$sb.Append($c)
+                }
+            }
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+$script:JsonStringFields = @(
+    'rule_id','category','confidence','base_confidence',
+    'host','scan_user','scan_user_priv','abs_path','rel_path',
+    'line_text','pre_context','post_context','match_text','match_redacted',
+    'key_name','file_mtime','file_mode','file_owner','dedup_key',
+    'decoder_applied','fp_reason','notes'
+)
+$script:JsonNumberFields = @('line_no','col_start','col_end','file_size','entropy')
+
+function ConvertTo-FindingJson {
+    # Hand-rolled JSON object writer for the finding record schema. Faster
+    # than ConvertTo-Json by ~2 orders of magnitude in PS5/PS7. Field order
+    # mirrors the spec (§4.6); demotions is JSON-array, scalar fields are
+    # strings or numbers, nulls emit explicit null literals.
     param([hashtable]$F)
-    $json = $F | ConvertTo-Json -Compress -Depth 6
-    Add-Content -LiteralPath $script:FindJsonl -Value $json -Encoding utf8
+    $sb = New-Object System.Text.StringBuilder 512
+    [void]$sb.Append('{')
+    $first = $true
+    foreach ($k in $script:JsonStringFields) {
+        $v = $F[$k]
+        if (-not $first) { [void]$sb.Append(',') }
+        [void]$sb.Append('"').Append($k).Append('":')
+        if ($null -eq $v) {
+            [void]$sb.Append('null')
+        } else {
+            [void]$sb.Append((Convert-JsonString ([string]$v)))
+        }
+        $first = $false
+    }
+    if (-not $first) { [void]$sb.Append(',') }
+    [void]$sb.Append('"demotions":[')
+    $dem = $F['demotions']
+    if ($dem -and $dem.Count -gt 0) {
+        $sep = ''
+        foreach ($d in $dem) {
+            [void]$sb.Append($sep).Append((Convert-JsonString ([string]$d)))
+            $sep = ','
+        }
+    }
+    [void]$sb.Append(']')
+    foreach ($k in $script:JsonNumberFields) {
+        $v = $F[$k]
+        [void]$sb.Append(',"').Append($k).Append('":')
+        if ($null -eq $v) {
+            [void]$sb.Append('null')
+        } elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
+            [void]$sb.Append(([string]$v))
+        } else {
+            try { [void]$sb.Append(([string][int64]$v)) }
+            catch { [void]$sb.Append('0') }
+        }
+    }
+    [void]$sb.Append('}')
+    return $sb.ToString()
+}
+
+function Save-Finding {
+    # Buffer: real file writes happen once per phase via Flush-Buffers below.
+    # Mutex/handle churn was the dominant cost at scale.
+    param([hashtable]$F)
+    if ($Output -eq 'console') { return }
+    $script:JsonlBuf.Add((ConvertTo-FindingJson $F))
 
     $loc = ''
     if ($F.line_no -and $F.line_no -gt 0) { $loc = ":$($F.line_no)" }
-    $hdr = "[{0}] {1,-26} {2}{3}" -f $F.confidence, $F.rule_id, $F.abs_path, $loc
-    Add-Content -LiteralPath $script:FindTxt -Value $hdr -Encoding utf8
+    $script:TxtBuf.Add(("[{0}] {1,-26} {2}{3}" -f $F.confidence, $F.rule_id, $F.abs_path, $loc))
     if ($F.match_text) {
-        if ($ShowSecrets) {
-            Add-Content -LiteralPath $script:FindTxt -Value ("       $($F.match_text)") -Encoding utf8
-        } else {
-            Add-Content -LiteralPath $script:FindTxt -Value ("       $($F.match_redacted)") -Encoding utf8
-        }
+        $script:TxtBuf.Add("       $($F.match_text)")
     }
     if ($F.fp_reason) {
-        Add-Content -LiteralPath $script:FindTxt -Value ("       fp_reason=$($F.fp_reason)") -Encoding utf8
+        $script:TxtBuf.Add("       fp_reason=$($F.fp_reason)")
     }
     if ($F.key_name) {
-        Add-Content -LiteralPath $script:FindTxt -Value ("       key=$($F.key_name)") -Encoding utf8
+        $script:TxtBuf.Add("       key=$($F.key_name)")
+    }
+}
+
+function Flush-Buffers {
+    # Single append per file at phase end. UTF-8 without BOM; matches
+    # what Add-Content -Encoding utf8 used to write.
+    if ($script:JsonlBuf.Count -gt 0) {
+        try { [System.IO.File]::AppendAllLines($script:FindJsonl, $script:JsonlBuf) } catch {}
+        $script:JsonlBuf.Clear()
+    }
+    if ($script:TxtBuf.Count -gt 0) {
+        try { [System.IO.File]::AppendAllLines($script:FindTxt, $script:TxtBuf) } catch {}
+        $script:TxtBuf.Clear()
+    }
+    if ($script:SkippedBuf.Count -gt 0) {
+        try { [System.IO.File]::AppendAllLines($script:SkippedLog, $script:SkippedBuf) } catch {}
+        $script:SkippedBuf.Clear()
     }
 }
 
 function Add-Skipped {
     param([string]$Path, [string]$Reason)
-    try { Add-Content -LiteralPath $script:SkippedLog -Value "$Path`t$Reason" -Encoding utf8 } catch {}
+    $script:SkippedBuf.Add("$Path`t$Reason")
     if ($script:SkippedCounts.ContainsKey($Reason)) { $script:SkippedCounts[$Reason]++ }
 }
 
@@ -648,10 +859,21 @@ function Invoke-GppDecrypt {
         $padded = $B64 + ('=' * $pad)
         $ct = [Convert]::FromBase64String($padded)
         if ($ct.Length -eq 0) { return $null }
+        # Real GPP ciphertexts are AES-256-CBC block-aligned (multiple of 16);
+        # the base64 trailing padding is stripped on disk so the decoded
+        # bytes may land a few short of an AES block. Zero-pad up to the
+        # next block; the printable-ascii guard at the end will reject
+        # mojibake that comes from non-GPP input padded this way.
+        if ($ct.Length % 16 -ne 0) {
+            $pad2 = 16 - ($ct.Length % 16)
+            $tmp = New-Object byte[] ($ct.Length + $pad2)
+            [Array]::Copy($ct, $tmp, $ct.Length)
+            $ct = $tmp
+        }
         $aes = [System.Security.Cryptography.Aes]::Create()
         try {
             $aes.Mode    = [System.Security.Cryptography.CipherMode]::CBC
-            $aes.Padding = [System.Security.Cryptography.PaddingMode]::Zeros
+            $aes.Padding = [System.Security.Cryptography.PaddingMode]::None
             $aes.KeySize = 256
             $aes.Key     = $script:GppKey
             $aes.IV      = New-Object byte[] 16
@@ -659,8 +881,27 @@ function Invoke-GppDecrypt {
             try {
                 $pt = $dec.TransformFinalBlock($ct, 0, $ct.Length)
             } finally { $dec.Dispose() }
+            # Decode UTF-16LE first, then trim trailing non-printable
+            # characters. The GPP encrypt path PKCS7-pads the AES blob,
+            # which after UTF-16LE decode lands as either trailing NUL
+            # characters or a single non-ASCII codepoint (e.g. \x02\x02
+            # decodes to U+0202). Trim those off rather than decoded
+            # ASCII characters mid-string.
             $text = [System.Text.Encoding]::Unicode.GetString($pt)
-            return $text.TrimEnd([char]0)
+            $end = $text.Length
+            while ($end -gt 0) {
+                $code = [int]$text[$end - 1]
+                if ($code -ge 0x20 -and $code -le 0x7E) { break }
+                $end--
+            }
+            if ($end -le 0) { return $null }
+            $text = $text.Substring(0, $end)
+            # Reject mojibake: GPP plaintexts are ASCII printable passwords.
+            foreach ($ch in $text.ToCharArray()) {
+                $code = [int]$ch
+                if ($code -lt 0x20 -or $code -gt 0x7E) { return $null }
+            }
+            return $text
         } finally { $aes.Dispose() }
     } catch { return $null }
 }
@@ -693,7 +934,9 @@ function Convert-CiscoType7 {
             if ($i + 1 -ge $body.Length) { break }
             $hexByte = $body.Substring($i, 2)
             $val = [Convert]::ToInt32($hexByte, 16)
-            $k = $key[($seed + $i / 2) % $key.Length]
+            # PowerShell `/` returns Double; force integer division.
+            $idx = ($seed + [int]($i / 2)) % $key.Length
+            $k = $key[$idx]
             $c = [char]($val -bxor [int]$k)
             [void]$out.Append($c)
         }
@@ -726,8 +969,7 @@ function Get-MatchContext {
 
 function Scan-PrivateKey {
     param([string]$Path, [string]$Content)
-    $pat = '-----BEGIN (?<t>(RSA |DSA |EC |OPENSSH |ENCRYPTED |PGP |SSH2 ENCRYPTED )?)PRIVATE KEY[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----'
-    $rx = [regex]::new($pat, 'Multiline')
+    $rx = Get-Rx '-----BEGIN (?<t>(RSA |DSA |EC |OPENSSH |ENCRYPTED |PGP |SSH2 ENCRYPTED )?)PRIVATE KEY[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----' 'Multiline'
     foreach ($m in $rx.Matches($Content)) {
         $enc = 'no'
         if ($Content -match '(?m)^(Proc-Type: 4,ENCRYPTED|DEK-Info:)') { $enc = 'yes' }
@@ -748,7 +990,7 @@ function Scan-PrivateKey {
 
 function Scan-Ppk {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '(?m)^PuTTY-User-Key-File-[23]:\s*(?<algo>\S+)')) {
+    foreach ($m in (Get-Rx '(?m)^PuTTY-User-Key-File-[23]:\s*(?<algo>\S+)').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'putty.ppk'
@@ -765,7 +1007,7 @@ function Scan-Ppk {
 
 function Scan-Wireguard {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '(?m)^\s*PrivateKey\s*=\s*(?<k>[A-Za-z0-9+/]{43}=)')) {
+    foreach ($m in (Get-Rx '(?m)^\s*PrivateKey\s*=\s*(?<k>[A-Za-z0-9+/]{43}=)').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'wireguard.privkey'
@@ -789,7 +1031,7 @@ function Scan-GppCpassword {
     )
     $seen = New-Object System.Collections.Generic.HashSet[string]
     foreach ($pat in $patterns) {
-        foreach ($m in [regex]::Matches($Content, $pat)) {
+        foreach ($m in (Get-Rx $pat).Matches($Content)) {
             $b64 = $m.Groups['b'].Value
             if (-not $seen.Add($b64)) { continue }
             $ctx = Get-MatchContext -M $m -Content $Content
@@ -827,7 +1069,7 @@ function Scan-GppCpassword {
 function Scan-ShadowHash {
     param([string]$Path, [string]$Content)
     $pat = '(?m)^(?<u>[A-Za-z_][A-Za-z0-9_.-]{0,31}):(?<h>\$(1|2[abxy]?|5|6|7|y|argon2(i|d|id))\$[A-Za-z0-9./$,=+\-]{10,}):'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $hash = $m.Groups['h'].Value
         $user = $m.Groups['u'].Value
@@ -856,7 +1098,7 @@ function Scan-ShadowHash {
 function Scan-Htpasswd {
     param([string]$Path, [string]$Content)
     $pat = '(?m)^(?<u>[A-Za-z0-9._-]+):(?<h>(\$(apr1|2[axyb]?|5|6)\$\S+|\{SHA\}[A-Za-z0-9+/=]{27,28}|[A-Za-z0-9./]{13}))\s*$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'htpasswd.line'
@@ -875,7 +1117,7 @@ function Scan-Htpasswd {
 function Scan-NetNTLMv2 {
     param([string]$Path, [string]$Content)
     $pat = '(?m)^(?<line>[^:\s]{1,64}::[^:\s]{1,64}:[A-Fa-f0-9]{16}:[A-Fa-f0-9]{32}:[A-Fa-f0-9]{32,})$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'netntlmv2'
@@ -894,7 +1136,7 @@ function Scan-NetNTLMv2 {
 function Scan-PwdumpNtlm {
     param([string]$Path, [string]$Content)
     $pat = '(?m)^(?<u>[^:\s]{1,256}):(?<rid>\d+):(?<lm>[A-Fa-f0-9]{32}):(?<nt>[A-Fa-f0-9]{32}):::'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'pwdump.ntlm'
@@ -912,7 +1154,7 @@ function Scan-PwdumpNtlm {
 
 function Scan-Krb5Asrep {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '\$krb5asrep\$(?<et>17|18|23)\$[^:\s]{1,256}:[A-Fa-f0-9]{16,}\$[A-Fa-f0-9]{32,}')) {
+    foreach ($m in (Get-Rx '\$krb5asrep\$(?<et>17|18|23)\$[^:\s]{1,256}:[A-Fa-f0-9]{16,}\$[A-Fa-f0-9]{32,}').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'krb5.asrep'
@@ -930,7 +1172,7 @@ function Scan-Krb5Asrep {
 
 function Scan-Krb5Tgs {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '\$krb5tgs\$(?<et>17|18|23)\$\*[^*\s]{1,256}\*\$[A-Fa-f0-9]{16,}\$[A-Fa-f0-9]{32,}')) {
+    foreach ($m in (Get-Rx '\$krb5tgs\$(?<et>17|18|23)\$\*[^*\s]{1,256}\*\$[A-Fa-f0-9]{16,}\$[A-Fa-f0-9]{32,}').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'krb5.tgs'
@@ -949,7 +1191,7 @@ function Scan-Krb5Tgs {
 function Scan-UriBasicCreds {
     param([string]$Path, [string]$Content)
     $pat = '\b(?<scheme>mongodb(\+srv)?|postgres(ql)?|mysql|mariadb|redis(s)?|amqps?|ldaps?|ftps?|sftp|ssh|mssql|jdbc:[a-z0-9]+|https?)://(?<user>[^/\s:@"''<>]{1,128}):(?<pw>[^/\s@"''<>]{1,256})@(?<host>[^\s"''<>]{1,256})'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $decUser = Convert-PercentDecode $m.Groups['user'].Value
         $decPw   = Convert-PercentDecode $m.Groups['pw'].Value
@@ -971,7 +1213,7 @@ function Scan-UriBasicCreds {
 function Scan-Netrc {
     param([string]$Path, [string]$Content)
     $pat = '(?im)^\s*machine\s+(?<m>\S+)\s+login\s+(?<l>\S+)\s+password\s+(?<p>\S{1,256})'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'netrc.cred'
@@ -990,7 +1232,7 @@ function Scan-Netrc {
 function Scan-Pgpass {
     param([string]$Path, [string]$Content)
     $pat = '(?m)^(?<host>[*A-Za-z0-9.\-]+):(?<port>\*|\d{1,5}):(?<db>\*|[^:\r\n]+):(?<user>[^:\r\n]+):(?<pw>(\\:|[^:\r\n])+)$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $pw = $m.Groups['pw'].Value
         if (Test-Placeholder $pw) { continue }
@@ -1011,7 +1253,7 @@ function Scan-Pgpass {
 function Scan-MyCnf {
     param([string]$Path, [string]$Content)
     $pat = '(?ims)^\s*\[(?<sec>client|mysql|mysqldump)\][\s\S]{0,2048}?^\s*password\s*=\s*(?<q>["'']?)(?<v>.{4,256}?)\k<q>\s*$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $pw = $m.Groups['v'].Value
         if (Test-Placeholder $pw) { continue }
@@ -1031,7 +1273,7 @@ function Scan-MyCnf {
 
 function Scan-TomcatUser {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '(?i)<user\b[^>]*\bpassword\s*=\s*"(?<v>[^"]{1,256})"')) {
+    foreach ($m in (Get-Rx '(?i)<user\b[^>]*\bpassword\s*=\s*"(?<v>[^"]{1,256})"').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $pw = Convert-HtmlDecode $m.Groups['v'].Value
         if (Test-Placeholder $pw) { continue }
@@ -1052,7 +1294,7 @@ function Scan-TomcatUser {
 function Scan-CiscoSecret {
     param([string]$Path, [string]$Content)
     $pat = '(?im)^\s*(?<en>enable\s+)?(?<typ>secret|password)\s+(?<lev>0|5|7|8|9)\s+(?<v>\S{4,256})\s*$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $val = $m.Groups['v'].Value
         $level = $m.Groups['lev'].Value
@@ -1093,7 +1335,7 @@ function Scan-CiscoSecret {
 function Scan-DotnetConnstr {
     param([string]$Path, [string]$Content)
     $pat = '(?i)(Server|Data Source)\s*=\s*[^;]+;[^"\r\n]*?(User\s*ID|UID)\s*=\s*[^;]+;[^"\r\n]*?(Password|Pwd)\s*=\s*(?<pw>[^;"\r\n]{1,256})'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $pw = $m.Groups['pw'].Value
         if (Test-Placeholder $pw) { continue }
@@ -1114,7 +1356,7 @@ function Scan-DotnetConnstr {
 function Scan-JdbcPassword {
     param([string]$Path, [string]$Content)
     $pat = '(?i)\bjdbc:[a-z0-9]+://[^?\s"'']+\?[^"''\r\n]*?(password|pwd)=(?<pw>[^&"''\r\n]{1,256})'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $pw = $m.Groups['pw'].Value
         if (Test-Placeholder $pw) { continue }
@@ -1135,7 +1377,7 @@ function Scan-JdbcPassword {
 function Scan-PsSecureString {
     param([string]$Path, [string]$Content)
     $pat = '(?i)ConvertTo-SecureString\s+(-String\s+)?(?<q>["''])(?<v>[^"''\r\n]{4,512})\k<q>\s+(-AsPlainText\s+-Force|-Force\s+-AsPlainText)'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $val = $m.Groups['v'].Value
         if (Test-Placeholder $val) { continue }
@@ -1156,7 +1398,7 @@ function Scan-PsSecureString {
 function Scan-DockerAuth {
     param([string]$Path, [string]$Content)
     $pat = '"auths"\s*:\s*\{[\s\S]*?"auth"\s*:\s*"(?<b>[A-Za-z0-9+/=]{8,})"'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $b64 = $m.Groups['b'].Value
         Add-Finding @{
@@ -1191,7 +1433,7 @@ function Scan-DockerAuth {
 
 function Scan-AnsibleVaultHeader {
     param([string]$Path, [string]$Content)
-    foreach ($m in [regex]::Matches($Content, '(?m)^\$ANSIBLE_VAULT;\d+\.\d+;AES256')) {
+    foreach ($m in (Get-Rx '(?m)^\$ANSIBLE_VAULT;\d+\.\d+;AES256').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'ansible.vault_header'
@@ -1212,7 +1454,7 @@ function Scan-AnsibleVaultHeader {
 function Scan-WinscpSession {
     param([string]$Path, [string]$Content)
     $pat = '(?im)^\s*Password\s*=\s*(?<v>[A-Za-z0-9+/=]{8,})\s*$'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $val = $m.Groups['v'].Value
         Add-Finding @{
@@ -1234,7 +1476,7 @@ function Scan-WinUnattendPassword {
     param([string]$Path, [string]$Content)
     if ($Path -notmatch '(?i)(unattend|sysprep)') { return }
     $pat = '(?is)<(?<tag>Password|AdministratorPassword|DomainPassword|LocalAccountPassword)>\s*<Value>(?<v>[^<]+)</Value>'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $val = $m.Groups['v'].Value.Trim()
         if (Test-Placeholder $val) { continue }
@@ -1299,11 +1541,12 @@ function Scan-WinScriptHelpers {
         @{ id='win.defaultpassword'; pat='(?i)\bDefault(User)?Password\s*[:=]\s*"?(?<v>[^"\r\n]{1,256})"?'; key='DefaultPassword' }
     )
     foreach ($p in $patterns) {
-        foreach ($m in [regex]::Matches($Content, $p.pat)) {
+        foreach ($m in (Get-Rx $p.pat).Matches($Content)) {
             $ctx = Get-MatchContext -M $m -Content $Content
             $val = $m.Groups['v'].Value
             if (Test-Placeholder $val) { continue }
-            $conf = 'MEDIUM'
+            $demotions = @()
+            $fp = $null
             if (Test-IdentifierShape $val) {
                 Add-Finding @{
                     rule_id    = $p.id
@@ -1320,11 +1563,16 @@ function Scan-WinScriptHelpers {
                 }
                 continue
             }
+            $conf = 'MEDIUM'
+            if (Test-Comment $ctx.line_text) { $conf = 'LOW'; $demotions += 'comment' }
+            if (Test-TestPath $Path)         { $conf = 'LOW'; $demotions += 'test_path' }
             Add-Finding @{
                 rule_id    = $p.id
                 category   = 'PASSWORD'
                 confidence = $conf
                 base_confidence = 'MEDIUM'
+                demotions  = $demotions
+                fp_reason  = $fp
                 abs_path   = $Path
                 line_no    = $ctx.line_no
                 line_text  = $ctx.line_text
@@ -1333,7 +1581,7 @@ function Scan-WinScriptHelpers {
             }
         }
     }
-    foreach ($m in [regex]::Matches($Content, '(?i)\bAutoAdminLogon\s*=\s*"?1"?')) {
+    foreach ($m in (Get-Rx '(?i)\bAutoAdminLogon\s*=\s*"?1"?').Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         Add-Finding @{
             rule_id    = 'win.autoadminlogon'
@@ -1352,21 +1600,21 @@ function Scan-WinScriptHelpers {
 function Scan-GenericAssign {
     param([string]$Path, [string]$Content)
     $pat = '(?im)(?<key>\b(password|passwd|pwd|pass|passphrase|secret|cred(ential)?s?|requirepass|bindpw|db[_-]?pass(word)?|smtp[_-]?pass(word)?|ansible[_-]?(ssh[_-]?pass|become[_-]?pass|password)|admin[_-]?pass(word)?|root[_-]?pass(word)?|master[_-]?pass(word)?))\s*(?:[:=]{1,2}|:=|=>)\s*(?<q>["''`]?)(?<val>(?!\s*$)[^\r\n"''`]{4,512})\k<q>'
-    foreach ($m in [regex]::Matches($Content, $pat)) {
+    foreach ($m in (Get-Rx $pat).Matches($Content)) {
         $ctx = Get-MatchContext -M $m -Content $Content
         $key = $m.Groups['key'].Value
         $val = $m.Groups['val'].Value.Trim()
         if (-not $val) { continue }
-        $conf = 'HIGH'
-        $baseConf = 'HIGH'
+        $conf      = 'HIGH'
+        $baseConf  = 'HIGH'
         $demotions = @()
-        $fp = $null
+        $fp        = $null
+        $entropy   = $null
 
         if (Test-Placeholder $val) {
             $conf = 'LOW'; $fp = 'placeholder'; $demotions += 'placeholder'
         } elseif (Test-EnvReference $val) {
             $conf = 'MEDIUM'; $fp = 'env_reference'; $demotions += 'env_reference'
-            $cat = 'REFERENCE'
         } elseif (Test-IdentifierShape $val -and ($m.Groups['q'].Value -eq '')) {
             $conf = 'LOW'; $fp = 'variable_reference'; $demotions += 'variable_reference'
         } elseif ($val.Length -lt 4) {
@@ -1387,7 +1635,7 @@ function Scan-GenericAssign {
             if ($ent.demoted) { $demotions += 'entropy' }
             $entropy = $ent.entropy
         }
-        if (-not $entropy) { $entropy = Get-Entropy $val }
+        if ($null -eq $entropy) { $entropy = Get-Entropy $val }
         $cat = if ($demotions -contains 'env_reference') { 'REFERENCE' } else { 'PASSWORD' }
         Add-Finding @{
             rule_id    = 'pw.assign.generic'
@@ -1463,17 +1711,31 @@ function Scan-FileContent {
         Scan-WinscpSession $Path $content
     }
     Scan-GenericAssign      $Path $content
+    # Drop the per-file line-starts cache so we don't grow unbounded
+    # across the candidate list.
+    if ($script:LineStartsCache) { $script:LineStartsCache.Clear() }
 }
 
 $script:ClassANameRegex = '^(id_rsa|id_dsa|id_ecdsa|id_ed25519|id_xmss|id_ecdsa_sk|id_ed25519_sk|authorized_keys|known_hosts|.htpasswd|.netrc|_netrc|.pgpass|.my\.cnf|.mylogin\.cnf|.smbcredentials|.cifs-credentials|.credentials|.git-credentials|.npmrc|.yarnrc|.yarnrc\.yml|kubeconfig|wg0\.conf|krb5\.keytab|azureProfile\.json|accessTokens\.json|application_default_credentials\.json|Groups\.xml|Services\.xml|ScheduledTasks\.xml|Drives\.xml|Printers\.xml|DataSources\.xml|unattend\.xml|autounattend\.xml|sysprep\.inf|sysprep\.xml|shadow\.bak|shadow\.old|shadow-|passwd\.bak|passwd-|gshadow\.bak|SAM|SYSTEM|SECURITY|ntds\.dit|WinSCP\.ini|sitemanager\.xml|recentservers\.xml|filezilla\.xml|confCons\.xml|MobaXterm\.ini|RDCMan\.settings|credentials\.xml|master\.key|hudson\.util\.Secret|initialAdminPassword|\.env|wp-config\.php|wp-config-sample\.php|configuration\.php|LocalSettings\.php|local\.xml|database\.yml|web\.config|app\.config|machine\.config|connectionStrings\.config|tnsnames\.ora|sqlnet\.ora|wallet\.sso|cwallet\.sso)$'
 
 $script:ClassAExtRegex = '\.(kdbx|kdb|psafe3|agilekeychain|opvault|1pif|pem|key|priv|pk8|pkcs8|rsa|dsa|ec|ppk|openssh|pfx|p12|jks|keystore|bks|uber|pkcs12|kubeconfig|ovpn|keytab|rdg|rdp|ica|tds|rtsz|rtsx)$'
 
+# Pre-compiled instances of the file-name classifiers. Called per candidate
+# file in Phase 3/4; precompile saves the regex re-parse per call.
+# IgnoreCase matches PowerShell's default -match behavior — load-bearing
+# for Windows fixtures (e.g. Unattend.xml vs unattend\.xml).
+$script:RxIgnore      = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+$script:RxClassAName  = Get-Rx $script:ClassANameRegex $script:RxIgnore
+$script:RxClassAExt   = Get-Rx $script:ClassAExtRegex  $script:RxIgnore
+$script:RxSkipExt     = Get-Rx $script:SkipExtRegex    $script:RxIgnore
+$script:RxSkipName    = Get-Rx $script:SkipNameRegex   $script:RxIgnore
+$script:RxDefaultExt  = Get-Rx $script:DefaultExtRegex $script:RxIgnore
+
 function Test-ClassAFile {
     param([string]$Name)
     if (-not $Name) { return $false }
-    if ($Name -match $script:ClassANameRegex) { return $true }
-    if ($Name -match $script:ClassAExtRegex) { return $true }
+    if ($script:RxClassAName.IsMatch($Name)) { return $true }
+    if ($script:RxClassAExt.IsMatch($Name)) { return $true }
     if ($Name -like '.env.*') { return $true }
     if ($Name -like 'bw_export_*.csv') { return $true }
     if ($Name -like 'lastpass_export*.csv') { return $true }
@@ -1511,10 +1773,10 @@ function Test-ExtensionAllowed {
     param([string]$Name)
     if (-not $Name) { return $false }
     $lower = $Name.ToLower()
-    if ($lower -match $script:SkipExtRegex) { return $false }
-    if ($lower -match $script:SkipNameRegex) { return $false }
+    if ($script:RxSkipExt.IsMatch($lower)) { return $false }
+    if ($script:RxSkipName.IsMatch($lower)) { return $false }
     if ($All) { return $true }
-    if ($lower -match $script:DefaultExtRegex) { return $true }
+    if ($script:RxDefaultExt.IsMatch($lower)) { return $true }
     if ($lower -in $script:DefaultExtNames) { return $true }
     if ($lower -like '*.dockerfile') { return $true }
     if ($lower -like 'docker-compose.y*ml') { return $true }
@@ -1534,26 +1796,59 @@ function Test-ExtensionAllowed {
 }
 
 function Get-CandidateFiles {
-    param([string]$Root)
+    # Walker:
+    # - Prunes excluded subtrees BEFORE recursing (key perf win).
+    # - Skips reparse points (junctions, symlinks) unless -FollowSymlinks
+    #   is set. Classic Windows hang source: C:\Documents and Settings
+    #   junction loops back into C:\Users.
+    # - Skips OneDrive/cloud placeholder files (FILE_ATTRIBUTE_OFFLINE
+    #   0x1000, FILE_ATTRIBUTE_RECALL_ON_OPEN 0x40000, RECALL_ON_DATA_ACCESS
+    #   0x400000) — reading them would trigger network download.
+    # - Honors -CrossMounts by tracking the original root's volume serial.
+    param([string]$Root, [scriptblock]$OnProgress = $null)
     $result = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $rootVolume = $null
+    if (-not $CrossMounts) {
+        try {
+            $rootInfo = [System.IO.DirectoryInfo]::new($Root)
+            if ($rootInfo.Root) { $rootVolume = $rootInfo.Root.FullName.ToLower() }
+        } catch {}
+    }
+    # Bitmask: ReparsePoint (0x400) | Offline (0x1000) | RecallOnOpen (0x40000)
+    # | RecallOnDataAccess (0x400000). Test with -band any.
+    $offlineFlags = 0x441400
+    $reparseFlag  = [int][System.IO.FileAttributes]::ReparsePoint
+    $dirSeen = 0
     try {
         $stack = New-Object System.Collections.Generic.Stack[string]
         $stack.Push($Root)
         while ($stack.Count -gt 0) {
             $cur = $stack.Pop()
+            $dirSeen++
+            if ($OnProgress -and ($dirSeen % 50 -eq 0)) { & $OnProgress $cur $dirSeen }
             try {
                 $di = [System.IO.DirectoryInfo]::new($cur)
                 if (-not $di.Exists) { continue }
+                # Don't cross mount boundaries unless asked.
+                if ($rootVolume -and $di.Root -and $di.Root.FullName.ToLower() -ne $rootVolume) { continue }
                 $entries = $null
                 try { $entries = $di.GetFileSystemInfos() } catch { Add-Skipped $cur 'perm'; continue }
                 foreach ($e in $entries) {
                     $full = $e.FullName
-                    if (Test-Excluded $full) { continue }
+                    if (Test-Excluded $full) {
+                        Add-Skipped $full 'excluded'
+                        continue
+                    }
+                    $attrInt = [int]$e.Attributes
+                    if ((-not $FollowSymlinks) -and (($attrInt -band $reparseFlag) -ne 0)) { continue }
+                    if (($attrInt -band $offlineFlags) -ne 0) {
+                        # OneDrive/iCloud placeholder; skip without opening.
+                        Add-Skipped $full 'excluded'
+                        continue
+                    }
                     if ($e -is [System.IO.DirectoryInfo]) {
-                        if ((-not $FollowSymlinks) -and ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
                         $stack.Push($full)
                     } else {
-                        if ((-not $FollowSymlinks) -and ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
                         $result.Add($e)
                     }
                 }
@@ -1796,8 +2091,11 @@ function Invoke-Phase2 {
     if ($SkipKnownLocations) { return }
     Write-Phase 'phase 2/5' 'known-locations sweep'
     $pre = $script:Findings.Count
+    $seen = 0
 
     foreach ($p in $script:KnownPaths) {
+        $seen++
+        Write-PhaseProgress -Phase '2/5: known locations' -Status $p
         try {
             if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) {
                 $it = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
@@ -1815,6 +2113,8 @@ function Invoke-Phase2 {
         } catch {}
     }
     foreach ($g in $script:KnownGlobs) {
+        $seen++
+        Write-PhaseProgress -Phase '2/5: known locations' -Status $g
         try {
             $items = Get-ChildItem -Path $g -Force -ErrorAction SilentlyContinue
             foreach ($it in $items) {
@@ -1826,6 +2126,8 @@ function Invoke-Phase2 {
         } catch {}
     }
     foreach ($up in Get-UserBasedKnownPaths) {
+        $seen++
+        Write-PhaseProgress -Phase '2/5: known locations' -Status $up
         try {
             if ($up -like '*\**' -or $up -like '*?*' -or $up -like '*\[*') {
                 $items = Get-ChildItem -Path $up -Force -ErrorAction SilentlyContinue
@@ -1842,10 +2144,13 @@ function Invoke-Phase2 {
         } catch {}
     }
 
+    Write-PhaseProgress -Phase '2/5: known locations' -Status 'registry/credentials enumeration'
     Invoke-RegistryProbes
     Invoke-CmdkeyList
     Invoke-VaultCmd
 
+    Complete-PhaseProgress -Phase '2/5: known locations'
+    Flush-Buffers
     $post = $script:Findings.Count
     Write-Info ("  {0} findings" -f ($post - $pre))
 }
@@ -1853,7 +2158,10 @@ function Invoke-Phase2 {
 function Invoke-Phase3 {
     Write-Phase 'phase 3/5' 'filename-pattern hunt'
     $pre = $script:Findings.Count
+    $rootIdx = 0
     foreach ($r in $ScanRoots) {
+        $rootIdx++
+        Write-PhaseProgress -Phase '3/5: filename hunt' -Status $r -Current $rootIdx -Total $ScanRoots.Count
         if (-not (Test-Path -LiteralPath $r -ErrorAction SilentlyContinue)) { continue }
         try {
             $rootInfo = Get-Item -LiteralPath $r -Force -ErrorAction SilentlyContinue
@@ -1873,7 +2181,11 @@ function Invoke-Phase3 {
                 continue
             }
         } catch {}
-        $files = Get-CandidateFiles $r
+        $progressCb = {
+            param($cur, $seen)
+            Write-PhaseProgress -Phase '3/5: filename hunt' -Status ("{0}  (dirs scanned: {1})" -f $cur, $seen)
+        }
+        $files = Get-CandidateFiles -Root $r -OnProgress $progressCb
         foreach ($fi in $files) {
             $name = $fi.Name
             if (Test-ClassAFile $name) {
@@ -1899,6 +2211,8 @@ function Invoke-Phase3 {
             }
         }
     }
+    Complete-PhaseProgress -Phase '3/5: filename hunt'
+    Flush-Buffers
     $post = $script:Findings.Count
     Write-Info ("  {0} findings" -f ($post - $pre))
 }
@@ -1908,7 +2222,10 @@ function Invoke-Phase4 {
     Write-Phase 'phase 4/5' 'content scan'
     $pre = $script:Findings.Count
     $candidates = New-Object System.Collections.Generic.List[string]
+    $rootIdx = 0
     foreach ($r in $ScanRoots) {
+        $rootIdx++
+        Write-PhaseProgress -Phase '4/5: build candidate list' -Status $r -Current $rootIdx -Total $ScanRoots.Count
         if (-not (Test-Path -LiteralPath $r -ErrorAction SilentlyContinue)) { continue }
         try {
             $rootInfo = Get-Item -LiteralPath $r -Force -ErrorAction SilentlyContinue
@@ -1917,17 +2234,40 @@ function Invoke-Phase4 {
                 continue
             }
         } catch {}
-        $files = Get-CandidateFiles $r
+        $progressCb = {
+            param($cur, $seen)
+            Write-PhaseProgress -Phase '4/5: build candidate list' -Status ("{0}  (dirs scanned: {1})" -f $cur, $seen)
+        }
+        $files = Get-CandidateFiles -Root $r -OnProgress $progressCb
         foreach ($fi in $files) {
             if (Test-ExtensionAllowed $fi.Name) { $candidates.Add($fi.FullName) }
         }
     }
     Write-Info ("  ({0} candidate files)" -f $candidates.Count)
-    if ($Workers -le 1 -or $candidates.Count -lt 4 -or $PSVersionTable.PSVersion.Major -lt 7) {
-        foreach ($f in $candidates) { Scan-FileContent $f }
-    } else {
-        foreach ($f in $candidates) { Scan-FileContent $f }
+
+    # Content scan with per-50-file progress update + ETA. Parallel paths
+    # (ForEach-Object -Parallel on PS7) are out of scope for this pass —
+    # they need separate per-worker buffers + merge, the serial loop is
+    # already much faster after the regex/buffer optimizations.
+    $total = $candidates.Count
+    if ($total -gt 0) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $i = 0
+        foreach ($f in $candidates) {
+            $i++
+            if (($i % 50) -eq 0 -or $i -eq $total) {
+                $elapsed = $sw.Elapsed.TotalSeconds
+                $rate = if ($elapsed -gt 0) { $i / $elapsed } else { 0 }
+                $remaining = $total - $i
+                $eta = if ($rate -gt 0) { [int]($remaining / $rate) } else { -1 }
+                $status = "{0}/{1} files ({2} findings, ETA {3}s)" -f $i, $total, $script:Findings.Count, $eta
+                Write-PhaseProgress -Phase '4/5: content scan' -Status $status -Current $i -Total $total
+            }
+            Scan-FileContent $f
+        }
     }
+    Complete-PhaseProgress -Phase '4/5: content scan'
+    Flush-Buffers
     $post = $script:Findings.Count
     Write-Info ("  {0} findings" -f ($post - $pre))
 }
@@ -1943,7 +2283,17 @@ function Get-ConfidenceColor {
 
 function Invoke-Phase5 {
     Write-Phase 'phase 5/5' 'rendering report'
-    foreach ($f in $script:Findings) { Save-Finding $f }
+    $total = $script:Findings.Count
+    $idx = 0
+    foreach ($f in $script:Findings) {
+        $idx++
+        if (($idx % 100) -eq 0 -or $idx -eq $total) {
+            Write-PhaseProgress -Phase '5/5: render' -Status ("serializing {0}/{1}" -f $idx, $total) -Current $idx -Total $total
+        }
+        Save-Finding $f
+    }
+    Flush-Buffers
+    Complete-PhaseProgress -Phase '5/5: render'
 
     $high = @($script:Findings | Where-Object { $_.confidence -eq 'HIGH' }).Count
     $med  = @($script:Findings | Where-Object { $_.confidence -eq 'MEDIUM' }).Count
@@ -1964,8 +2314,7 @@ function Invoke-Phase5 {
             $line = "  [HIGH] {0,-26} {1}{2}" -f $f.rule_id, $f.abs_path, $loc
             if ($script:UseColor) { Write-Host $line -ForegroundColor Red } else { Write-Host $line }
             if ($f.match_text) {
-                $shown = if ($ShowSecrets) { $f.match_text } else { $f.match_redacted }
-                if ($script:UseColor) { Write-Host "         $shown" -ForegroundColor DarkGray } else { Write-Host "         $shown" }
+                if ($script:UseColor) { Write-Host "         $($f.match_text)" -ForegroundColor DarkGray } else { Write-Host "         $($f.match_text)" }
             }
             if ($f.key_name) {
                 if ($script:UseColor) { Write-Host "         key=$($f.key_name)" -ForegroundColor DarkGray } else { Write-Host "         key=$($f.key_name)" }
@@ -1985,8 +2334,7 @@ function Invoke-Phase5 {
                 $line = "  [MED]  {0,-26} {1}{2}" -f $f.rule_id, $f.abs_path, $loc
                 if ($script:UseColor) { Write-Host $line -ForegroundColor Yellow } else { Write-Host $line }
                 if ($f.match_text) {
-                    $shown = if ($ShowSecrets) { $f.match_text } else { $f.match_redacted }
-                    if ($script:UseColor) { Write-Host "         $shown" -ForegroundColor DarkGray } else { Write-Host "         $shown" }
+                    if ($script:UseColor) { Write-Host "         $($f.match_text)" -ForegroundColor DarkGray } else { Write-Host "         $($f.match_text)" }
                 }
             }
             if ($med -gt 25) { Write-Host "  ... and $($med - 25) more (see findings.txt)" }
@@ -2017,13 +2365,15 @@ function Invoke-Phase5 {
         Write-Host ("   Skipped (size):     {0,5}" -f $script:SkippedCounts['size'])
         Write-Host ("   Skipped (binary):   {0,5}" -f $script:SkippedCounts['binary'])
         Write-Host ("   Skipped (perm):     {0,5}" -f $script:SkippedCounts['perm'])
-        Write-Host ("   Report:    {0}" -f $script:FindTxt)
-        Write-Host ("              {0}" -f $script:FindJsonl)
-        Write-Host ("              {0}" -f $script:SkippedLog)
-        if ($ShowSecrets) {
-            Write-Host ""
-            Write-Host "   !! --show-secrets emitted plaintext to disk; delete $OutDir post-engagement"
+        Write-Host ("   Skipped (excluded): {0,5}" -f $script:SkippedCounts['excluded'])
+        Write-Host ("   Dedup suppressed:   {0,5}" -f $script:DupSuppressed)
+        if ($Output -ne 'console') {
+            Write-Host ("   Report:    {0}" -f $script:FindTxt)
+            Write-Host ("              {0}" -f $script:FindJsonl)
+            Write-Host ("              {0}" -f $script:SkippedLog)
         }
+        Write-Host ""
+        Write-Host "   !! findings contain plaintext credentials; delete $OutDir post-engagement"
         Write-Host "====================================================="
     }
 
