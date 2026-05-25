@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<Groups clsid="{3125E937-EB16-4b4c-9934-544FC6D24D26}">
-  <User clsid="{DF5F1855-51E5-4d24-8B1A-D9BDE98BA1D1}" name="svcLocalAdmin" image="2" changed="2014-06-12 10:21:11" uid="{B924A75E-B26B-4D2A-A6F3-69E7C0F2F9F1}">
-    <Properties action="U" newName="" fullName="" description="" cpassword="riBZp2ux4hIngoMtjkdtsbZGOULDg+iLfBE9X1MnTLM" changeLogon="0" noChange="1" neverExpires="1" acctDisabled="0" userName="svcLocalAdmin" />
-  </User>
-</Groups>
