@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    credshunter — Windows credential discovery for authorized post-exploitation.
+    credshunter - Windows credential discovery for authorized post-exploitation.
 
 .DESCRIPTION
     Hunts hard-coded passwords, private keys, NTLM hashes, database creds,
@@ -26,16 +26,23 @@
 
 .PARAMETER NoSizeLimit
     Disable the file-size cap entirely (scan files of any size). Use with
-    caution — large logs and archives are slow and full of binary data.
+    caution - large logs and archives are slow and full of binary data.
 
 .PARAMETER OutputFile
     Append a plaintext log of all findings to this file.
 
 .PARAMETER SkipSystem
-    Skip the OS-level credential checks (registry, GPP, unattend, …).
+    Skip the OS-level credential checks (registry, GPP, unattend, ...).
 
 .PARAMETER Quiet
     Less verbose output. Findings still printed.
+
+.PARAMETER ExcludePath
+    One or more directory paths to skip during scanning. The directory itself
+    and every subdirectory beneath it are pruned from stages 2-5 (candidate
+    enumeration, suspicious-name search, high-value / confirmed-container
+    search, content scan). Has NO effect on stage 1 (OS-level credential
+    checks), which always use their own hardcoded locations.
 
 .PARAMETER NoColor
     Disable ANSI colors in the console output.
@@ -70,6 +77,8 @@ param(
 
     [switch] $SkipSystem,
 
+    [string[]] $ExcludePath = @(),
+
     [switch] $Quiet,
 
     [switch] $NoColor
@@ -86,6 +95,24 @@ $script:MaxFileSizeBytes  = $MaxFileSizeMB * 1MB
 $script:SkipLarge         = -not $NoSizeLimit.IsPresent
 $script:MaxMatchesPerFile = 20
 $script:MaxPreviewLen     = 140
+
+# Operator-supplied exclusions (-ExcludePath). Normalised to absolute paths
+# and merged into $script:ExcludePathPrefixes further below so the existing
+# Test-DirectoryExcluded helper applies them automatically during stages 2-5.
+# OS-level checks (stage 1) never consult ExcludePathPrefixes, so they are
+# unaffected -- per spec.
+$script:UserExcludePaths = @()
+foreach ($p in $ExcludePath) {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    try {
+        $abs = [System.IO.Path]::GetFullPath($p)
+    } catch {
+        $abs = $p
+    }
+    $abs = $abs.TrimEnd('\','/')
+    if ($abs.Length -eq 0) { $abs = $p }
+    $script:UserExcludePaths += $abs
+}
 
 # ----------------------------------------------------------------------------
 #  Color support (ANSI escape sequences, honors NO_COLOR / -NoColor)
@@ -135,7 +162,7 @@ $script:ScannedPaths         = [System.Collections.Generic.HashSet[string]]::new
 # subset of the generic stage-4 patterns, tuned for the formats commonly
 # found in OS-known credential locations (GPP XML, unattend XML, .env,
 # .bashrc, .htpasswd, shadow, netrc, wp-config, registry dumps, etc.).
-# Stage 4 uses HighPatterns below — they overlap, but kept separate so OS
+# Stage 4 uses HighPatterns below - they overlap, but kept separate so OS
 # checks stay independent of the recursive content-scan pipeline.
 $script:OsPatterns = @(
     @{ Label = 'password';
@@ -283,7 +310,7 @@ $script:SearchExtensions = @(
 )
 
 # Extensions whose presence ALONE confirms credential material. These are
-# dedicated credential / password-database / keystore formats — finding one
+# dedicated credential / password-database / keystore formats - finding one
 # means you've found credentials, full stop. Reported in their own
 # "Confirmed credential containers" section ahead of the auxiliary list.
 $script:GuaranteedCredExtensions = @(
@@ -297,7 +324,7 @@ $script:GuaranteedCredExtensions = @(
     '.enpass','.enpassdb'                   # Enpass
     '.bitwarden_export'                     # Bitwarden export
 
-    # Private-key / cert+key bundles — never public
+    # Private-key / cert+key bundles - never public
     '.ppk'                                  # PuTTY private key
     '.pfx','.p12'                           # PKCS#12 (cert + private key)
     '.pvk'                                  # Microsoft private key file
@@ -315,19 +342,19 @@ $script:GuaranteedCredExtensions = @(
     '.dpapimk'
 )
 
-# Auxiliary credential-related extensions. STRONG signal but not 100% — a
+# Auxiliary credential-related extensions. STRONG signal but not 100% - a
 # .pem may be a public cert, a .gpg may be encrypted data rather than a
 # private key, a .rdp may not have the password saved, etc. Reported under
-# "Interesting credential-related files" — worth inspecting, not assumed.
+# "Interesting credential-related files" - worth inspecting, not assumed.
 $script:HighValueExtensions = @(
     '.pem','.key','.priv'                   # PEM-encoded data (key OR cert)
     '.asc','.gpg'                           # PGP material (sig, key, or encrypted)
-    '.rdp'                                  # Saved RDP — may carry creds
+    '.rdp'                                  # Saved RDP - may carry creds
     '.ovpn'                                 # OpenVPN profile
     '.wallet'                               # Oracle wallet / various
 )
 
-# Suspicious filename fragments — case-insensitive substring match against
+# Suspicious filename fragments - case-insensitive substring match against
 # the basename. Kept INTENTIONALLY TIGHT: every term here must be a strong
 # credential indicator on its own. Generic words ('config', 'key', 'conn',
 # 'backup', 'account', 'login', 'auth') are excluded because:
@@ -407,6 +434,12 @@ $script:ExcludePathPrefixes = @(
     "$env:SystemDrive\System Volume Information"
 ) | Where-Object { $_ -and $_.Trim() -ne '' }
 
+# Fold operator-supplied -ExcludePath entries into the prefix list so
+# Test-DirectoryExcluded prunes them automatically during stages 2-5.
+if ($script:UserExcludePaths.Count -gt 0) {
+    $script:ExcludePathPrefixes = @($script:ExcludePathPrefixes) + $script:UserExcludePaths
+}
+
 # ============================================================================
 #  Output helpers
 # ============================================================================
@@ -414,16 +447,16 @@ $script:ExcludePathPrefixes = @(
 function Write-Banner {
     if ($Quiet) { return }
     Write-Host ""
-    Write-Host "$($script:CC)$($script:CBold)  ┌─────────────────────────────────────────────────────────────┐$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  │  credshunter  ·  Windows credential discovery for pentesters │$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  │  v$($script:Version)  ·  $($script:CD)authorized testing only · read-only$($script:CNC)$($script:CC)$($script:CBold)              │$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  └─────────────────────────────────────────────────────────────┘$($script:CNC)"
+    Write-Host "$($script:CC)$($script:CBold)  +-------------------------------------------------------------+$($script:CNC)"
+    Write-Host "$($script:CC)$($script:CBold)  |  credshunter  *  Windows credential discovery for pentesters |$($script:CNC)"
+    Write-Host "$($script:CC)$($script:CBold)  |  v$($script:Version)  *  $($script:CD)authorized testing only * read-only$($script:CNC)$($script:CC)$($script:CBold)              |$($script:CNC)"
+    Write-Host "$($script:CC)$($script:CBold)  +-------------------------------------------------------------+$($script:CNC)"
     Write-Host ""
 }
 
 function Write-Section { param([string]$Title)
     Write-Host ""
-    Write-Host "$($script:CBold)$($script:CC)═══ $Title ═══$($script:CNC)"
+    Write-Host "$($script:CBold)$($script:CC)=== $Title ===$($script:CNC)"
 }
 
 function Write-Info { param([string]$Msg) if (-not $Quiet) { Write-Host "$($script:CB)[*]$($script:CNC) $Msg" } }
@@ -522,7 +555,7 @@ function Format-Preview { param([string]$Text)
     $t = $t -replace '\s+', ' '
     $t = $t.Trim()
     if ($t.Length -gt $script:MaxPreviewLen) {
-        $t = $t.Substring(0, $script:MaxPreviewLen) + '…'
+        $t = $t.Substring(0, $script:MaxPreviewLen) + '...'
     }
     return $t
 }
@@ -595,7 +628,7 @@ function Add-Skipped { param([string]$Path, [string]$Reason)
 # set plus private-key markers to a known credential-bearing file.
 #
 # Used by stage-1 OS checks ONLY. Stage-4 file-content scanning calls
-# Invoke-FileContentScan below — the two are intentionally separate so
+# Invoke-FileContentScan below - the two are intentionally separate so
 # that the recursive content-scan pipeline processes only extension-matched
 # candidates from the user-supplied paths.
 function Invoke-OSExtract { param([string]$FullPath, [string]$Label)
@@ -756,7 +789,7 @@ function Test-KnownFile { param([string]$Path, [string]$Label)
 # ============================================================================
 
 function Test-RegistryAutoLogon {
-    Write-Info "Checking AutoLogon registry…"
+    Write-Info "Checking AutoLogon registry..."
     $keys = @(
         'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\AutoLogon'
@@ -783,7 +816,7 @@ function Test-RegistryAutoLogon {
 }
 
 function Test-GPPCPassword {
-    Write-Info "Checking Group Policy Preferences (cpassword)…"
+    Write-Info "Checking Group Policy Preferences (cpassword)..."
     $roots = @(
         Join-Path $env:SystemRoot 'SYSVOL'
         Join-Path $env:ProgramData 'Microsoft\Group Policy\History'
@@ -807,7 +840,7 @@ function Test-GPPCPassword {
 }
 
 function Test-UnattendedInstall {
-    Write-Info "Checking unattended install files…"
+    Write-Info "Checking unattended install files..."
     $files = @(
         Join-Path $env:SystemRoot 'Panther\Unattend.xml'
         Join-Path $env:SystemRoot 'Panther\Unattended.xml'
@@ -826,7 +859,7 @@ function Test-UnattendedInstall {
 }
 
 function Test-PowerShellHistory {
-    Write-Info "Checking PowerShell history…"
+    Write-Info "Checking PowerShell history..."
     $hist = Join-Path $env:APPDATA 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
     Test-KnownFile -Path $hist -Label 'powershell_history'
     # All users
@@ -841,7 +874,7 @@ function Test-PowerShellHistory {
 }
 
 function Test-CmdkeyVault {
-    Write-Info "Checking Windows credential vault references…"
+    Write-Info "Checking Windows credential vault references..."
     try {
         $out = & cmdkey.exe /list 2>$null
         if ($out) {
@@ -880,7 +913,7 @@ function Test-CmdkeyVault {
 }
 
 function Test-RDPSavedSessions {
-    Write-Info "Checking saved RDP sessions and .rdp files…"
+    Write-Info "Checking saved RDP sessions and .rdp files..."
     $keys = @(
         'HKCU:\Software\Microsoft\Terminal Server Client\Servers'
         'HKCU:\Software\Microsoft\Terminal Server Client\Default'
@@ -913,7 +946,7 @@ function Test-RDPSavedSessions {
 }
 
 function Test-PuTTYSessions {
-    Write-Info "Checking PuTTY saved sessions…"
+    Write-Info "Checking PuTTY saved sessions..."
     $root = 'HKCU:\Software\SimonTatham\PuTTY\Sessions'
     if (Test-Path $root) {
         Add-Checked -Label 'putty_sessions' -Path $root
@@ -936,7 +969,7 @@ function Test-PuTTYSessions {
 }
 
 function Test-WinSCPSessions {
-    Write-Info "Checking WinSCP saved sessions…"
+    Write-Info "Checking WinSCP saved sessions..."
     $root = 'HKCU:\Software\Martin Prikryl\WinSCP 2\Sessions'
     if (Test-Path $root) {
         Add-Checked -Label 'winscp_sessions' -Path $root
@@ -970,7 +1003,7 @@ function Test-WinSCPSessions {
 }
 
 function Test-FileZilla {
-    Write-Info "Checking FileZilla configuration…"
+    Write-Info "Checking FileZilla configuration..."
     $files = @(
         Join-Path $env:APPDATA 'FileZilla\sitemanager.xml'
         Join-Path $env:APPDATA 'FileZilla\recentservers.xml'
@@ -986,7 +1019,7 @@ function Test-FileZilla {
 }
 
 function Test-VNCRegistry {
-    Write-Info "Checking VNC registry keys…"
+    Write-Info "Checking VNC registry keys..."
     $keys = @(
         'HKLM:\SOFTWARE\TightVNC\Server'
         'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server'
@@ -1013,7 +1046,7 @@ function Test-VNCRegistry {
 }
 
 function Test-SNMPRegistry {
-    Write-Info "Checking SNMP community strings…"
+    Write-Info "Checking SNMP community strings..."
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\SNMP\Parameters\ValidCommunities'
     if (Test-Path $key) {
         Add-Checked -Label 'snmp_communities' -Path $key
@@ -1029,7 +1062,7 @@ function Test-SNMPRegistry {
 }
 
 function Test-SAMHives {
-    Write-Info "Checking SAM/SYSTEM/SECURITY hive files…"
+    Write-Info "Checking SAM/SYSTEM/SECURITY hive files..."
     $hives = @(
         (Join-Path $env:SystemRoot 'System32\config\SAM')
         (Join-Path $env:SystemRoot 'System32\config\SYSTEM')
@@ -1049,7 +1082,7 @@ function Test-SAMHives {
                 $fs = [System.IO.File]::OpenRead($h)
                 $fs.Close()
                 Add-Interesting -Category 'readable_hive' -Path $h
-                Add-Finding -Bucket Key -Label 'readable_sam_hive' -Path $h -LineNumber 0 -Preview "Hive readable — extract with secretsdump.py / impacket-secretsdump"
+                Add-Finding -Bucket Key -Label 'readable_sam_hive' -Path $h -LineNumber 0 -Preview "Hive readable - extract with secretsdump.py / impacket-secretsdump"
             } catch {
                 # locked, expected on running system
             }
@@ -1058,7 +1091,7 @@ function Test-SAMHives {
 }
 
 function Test-IISConfigs {
-    Write-Info "Checking IIS web.config and applicationHost.config…"
+    Write-Info "Checking IIS web.config and applicationHost.config..."
     $files = @(
         Join-Path $env:SystemRoot 'System32\inetsrv\config\applicationHost.config'
         Join-Path $env:SystemRoot 'System32\inetsrv\config\administration.config'
@@ -1091,7 +1124,7 @@ function Test-IISConfigs {
 }
 
 function Test-ScheduledTasks {
-    Write-Info "Checking scheduled task XML definitions…"
+    Write-Info "Checking scheduled task XML definitions..."
     $tasks = Join-Path $env:SystemRoot 'System32\Tasks'
     if (-not (Test-Path -LiteralPath $tasks)) { return }
     try {
@@ -1111,7 +1144,7 @@ function Test-ScheduledTasks {
 }
 
 function Test-ServiceCredentials {
-    Write-Info "Checking service accounts running as non-system users…"
+    Write-Info "Checking service accounts running as non-system users..."
     try {
         $svcs = Get-WmiObject -Class Win32_Service -ErrorAction SilentlyContinue
         foreach ($s in $svcs) {
@@ -1124,7 +1157,7 @@ function Test-ServiceCredentials {
 }
 
 function Test-WiFiProfiles {
-    Write-Info "Checking saved Wi-Fi profile keys (requires admin for clear text)…"
+    Write-Info "Checking saved Wi-Fi profile keys (requires admin for clear text)..."
     try {
         $profilesOut = & netsh.exe wlan show profiles 2>$null
         if ($profilesOut) {
@@ -1152,7 +1185,7 @@ function Test-WiFiProfiles {
 }
 
 function Test-McAfeeSiteList {
-    Write-Info "Checking McAfee SiteList (legacy ePO)…"
+    Write-Info "Checking McAfee SiteList (legacy ePO)..."
     $candidates = @(
         Join-Path ${env:ProgramFiles} 'McAfee\Common Framework\SiteList.xml'
         Join-Path ${env:ProgramFiles(x86)} 'McAfee\Common Framework\SiteList.xml'
@@ -1168,7 +1201,7 @@ function Test-McAfeeSiteList {
 }
 
 function Test-BrowserCredentialFiles {
-    Write-Info "Checking browser credential databases…"
+    Write-Info "Checking browser credential databases..."
     $users = Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive '\Users') -Directory -ErrorAction SilentlyContinue
     foreach ($u in $users) {
         $candidates = @(
@@ -1190,7 +1223,7 @@ function Test-BrowserCredentialFiles {
 }
 
 function Test-CloudCliCredentials {
-    Write-Info "Checking cloud CLI credential stores…"
+    Write-Info "Checking cloud CLI credential stores..."
     $users = Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive '\Users') -Directory -ErrorAction SilentlyContinue
     foreach ($u in $users) {
         $candidates = @(
@@ -1220,7 +1253,7 @@ function Test-CloudCliCredentials {
 }
 
 function Test-SSHKeysWindows {
-    Write-Info "Checking SSH keys in user profiles…"
+    Write-Info "Checking SSH keys in user profiles..."
     $users = Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive '\Users') -Directory -ErrorAction SilentlyContinue
     foreach ($u in $users) {
         $ssh = Join-Path $u.FullName '.ssh'
@@ -1241,7 +1274,7 @@ function Test-SSHKeysWindows {
 }
 
 function Test-MiscWindowsLocations {
-    Write-Info "Checking misc Windows locations (OpenVPN, SQL, etc.)…"
+    Write-Info "Checking misc Windows locations (OpenVPN, SQL, etc.)..."
     $extras = @(
         Join-Path ${env:ProgramFiles} 'OpenVPN\config'
         Join-Path ${env:ProgramFiles(x86)} 'OpenVPN\config'
@@ -1265,7 +1298,7 @@ function Test-MiscWindowsLocations {
 }
 
 function Invoke-SystemChecks {
-    Write-Section "Stage 1 — OS-level credential locations"
+    Write-Section "Stage 1 - OS-level credential locations"
     Test-RegistryAutoLogon
     Test-GPPCPassword
     Test-UnattendedInstall
@@ -1355,10 +1388,10 @@ function Get-CandidateFiles {
     return $result
 }
 
-# Stage 2a — confirmed credential containers (extension alone is proof).
+# Stage 2a - confirmed credential containers (extension alone is proof).
 function Find-GuaranteedCredentials {
     param([string[]]$Paths)
-    Write-Section "Stage 2 — Confirmed credential containers"
+    Write-Section "Stage 2 - Confirmed credential containers"
     $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) {
@@ -1389,10 +1422,10 @@ function Find-GuaranteedCredentials {
     }
 }
 
-# Stage 2b — auxiliary credential-related files (high value but ambiguous).
+# Stage 2b - auxiliary credential-related files (high value but ambiguous).
 function Find-HighValueFiles {
     param([string[]]$Paths)
-    Write-Section "Stage 3 — Auxiliary credential-related files"
+    Write-Section "Stage 3 - Auxiliary credential-related files"
     $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) {
@@ -1421,7 +1454,7 @@ function Find-HighValueFiles {
 
 function Find-SuspiciousNames {
     param([string[]]$Paths)
-    Write-Section "Stage 4 — Suspicious filenames"
+    Write-Section "Stage 4 - Suspicious filenames"
     $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) {
@@ -1453,12 +1486,12 @@ function Find-SuspiciousNames {
 
 function Invoke-UserPathScan {
     param([string[]]$Paths)
-    Write-Section "Stage 5 — File-content scan"
+    Write-Section "Stage 5 - File-content scan"
     if (-not $Paths -or $Paths.Count -eq 0) {
         Write-Warn "No paths provided; skipping content scan."
         return
     }
-    Write-Info "Enumerating candidate files…"
+    Write-Info "Enumerating candidate files..."
     $files = Get-CandidateFiles -Paths $Paths -AllMode $All.IsPresent
     $total = $files.Count
     if ($total -eq 0) {
@@ -1491,7 +1524,7 @@ function Write-FindingsSection {
     param([string]$Title, [System.Collections.Generic.List[object]]$List, [string]$Tag, [string]$Color)
     if ($List.Count -eq 0) { return }
     Write-Host ""
-    Write-Host "$($script:CBold)$($script:CW)▸ $Title$($script:CNC)"
+    Write-Host "$($script:CBold)$($script:CW)> $Title$($script:CNC)"
     Write-LogLine ""
     Write-LogLine "=== $Title ==="
     foreach ($f in $List | Sort-Object Label, Path, LineNumber) {
@@ -1507,7 +1540,7 @@ function Write-FullSummary {
     # CRITICAL: confirmed credential containers (extension == proof)
     if ($script:Guaranteed.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)▸ Confirmed credential containers  ⚠$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)> Confirmed credential containers  !$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Confirmed credential containers ==="
         foreach ($g in $script:Guaranteed | Sort-Object Extension, Path) {
@@ -1521,7 +1554,7 @@ function Write-FullSummary {
 
     if ($script:Interesting.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)▸ Interesting credential-related files$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)> Interesting credential-related files$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Interesting credential-related files ==="
         foreach ($i in $script:Interesting | Sort-Object Category, Path) {
@@ -1532,7 +1565,7 @@ function Write-FullSummary {
 
     if ($script:SuspiciousNamesFound.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)▸ Suspicious filenames$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)> Suspicious filenames$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Suspicious filenames ==="
         foreach ($n in $script:SuspiciousNamesFound | Sort-Object -Unique) {
@@ -1545,7 +1578,7 @@ function Write-FullSummary {
 
     if ($script:LocationsChecked.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)▸ OS locations checked$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)> OS locations checked$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== OS locations checked ==="
         foreach ($c in $script:LocationsChecked | Sort-Object Label, Path) {
@@ -1556,7 +1589,7 @@ function Write-FullSummary {
 
     if ($script:SkippedFiles.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)▸ Skipped files$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)> Skipped files$($script:CNC)"
         Write-Host ("  $($script:CD)[SKIP]$($script:CNC) {0} file(s) skipped (binary / size / unreadable). See log." -f $script:SkippedFiles.Count)
         Write-LogLine ""
         Write-LogLine "=== Skipped files ==="
@@ -1577,8 +1610,8 @@ function Write-FullSummary {
     $nSkip  = $script:SkippedFiles.Count
     $fmt = "  {0,-44} {1,5}"
     Write-Host ("$($script:CBold)" + ($fmt -f 'Category','Count') + "$($script:CNC)")
-    Write-Host ('  ' + ('─' * 44) + '  ' + ('─' * 5))
-    Write-Host ("$($script:CBold)$($script:CR)" + ($fmt -f 'Confirmed credential containers ⚠',    $nGuar)  + "$($script:CNC)")
+    Write-Host ('  ' + ('-' * 44) + '  ' + ('-' * 5))
+    Write-Host ("$($script:CBold)$($script:CR)" + ($fmt -f 'Confirmed credential containers !',    $nGuar)  + "$($script:CNC)")
     Write-Host ("$($script:CR)" + ($fmt -f 'High-confidence credentials',           $nHigh)  + "$($script:CNC)")
     Write-Host ("$($script:CM)" + ($fmt -f 'Private keys / auth material',          $nKey)   + "$($script:CNC)")
     Write-Host ("$($script:CC)" + ($fmt -f 'Auxiliary credential-related files',    $nInt)   + "$($script:CNC)")
@@ -1586,7 +1619,7 @@ function Write-FullSummary {
     Write-Host ("$($script:CD)" + ($fmt -f 'Low-confidence (review)',               $nLow)   + "$($script:CNC)")
     Write-Host ("$($script:CB)" + ($fmt -f 'OS locations checked',                  $nCheck) + "$($script:CNC)")
     Write-Host ("$($script:CD)" + ($fmt -f 'Files skipped (size/binary/perm)',      $nSkip)  + "$($script:CNC)")
-    Write-Host ('  ' + ('─' * 44) + '  ' + ('─' * 5))
+    Write-Host ('  ' + ('-' * 44) + '  ' + ('-' * 5))
 
     Write-LogLine ""
     Write-LogLine "Summary:"
@@ -1626,7 +1659,14 @@ function Invoke-Main {
     if ($script:SkipLarge) {
         Write-Info ("Size cap: skipping files larger than $($script:CW){0} MB$($script:CNC)  (use -MaxFileSizeMB N to change, -NoSizeLimit to disable)" -f $MaxFileSizeMB)
     } else {
-        Write-Warn "Size cap disabled (-NoSizeLimit) — every readable file will be inspected."
+        Write-Warn "Size cap disabled (-NoSizeLimit) - every readable file will be inspected."
+    }
+
+    if ($script:UserExcludePaths.Count -gt 0) {
+        Write-Info ("User exclusions ($($script:CW){0}$($script:CNC)) - skipped during stages 2-5, not stage 1:" -f $script:UserExcludePaths.Count)
+        foreach ($p in $script:UserExcludePaths) {
+            Write-Host ("       $($script:CD)- {0}$($script:CNC)" -f $p)
+        }
     }
 
     if (-not $SkipSystem) {

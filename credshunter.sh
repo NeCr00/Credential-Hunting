@@ -30,6 +30,7 @@ QUIET=0
 SKIP_SYSTEM=0
 NO_COLOR_FLAG=0
 SCAN_PATHS=()
+USER_EXCLUDE_PATHS=()   # extra exclusions supplied by the operator (-x / --exclude)
 OUTPUT_FILE=""
 MAX_MATCHES_PER_FILE=20
 MAX_PREVIEW_LEN=140
@@ -147,6 +148,13 @@ system locations and within user-supplied directory trees.
 Options:
   -p, --path PATH        Path to scan recursively. Repeat for multiple paths.
                          File-content scanning is limited to these paths.
+  -x, --exclude PATH     Path to skip during scanning. The directory itself
+                         AND everything under it are pruned from stages 2-5
+                         (candidate enumeration, suspicious-name search,
+                         high-value/confirmed-container search, content scan).
+                         Repeat for multiple exclusions. Has NO effect on
+                         stage 1 (OS-level credential checks), which always
+                         use their own hardcoded locations.
   -a, --all              Scan all readable text files in PATH, not only
                          credential-related extensions.
   -m, --max-size N       Skip files larger than N MB (default: 5). Applies to
@@ -180,6 +188,7 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -p|--path)        SCAN_PATHS+=("$2"); shift 2 ;;
+            -x|--exclude)     USER_EXCLUDE_PATHS+=("$2"); shift 2 ;;
             -a|--all)         ALL_MODE=1; shift ;;
             -m|--max-size)    MAX_FILE_SIZE_MB="$2"; SKIP_LARGE=1; shift 2 ;;
             --no-size-limit)  SKIP_LARGE=0; shift ;;
@@ -202,6 +211,36 @@ parse_args() {
     [[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]] || { err "max-size must be a number"; exit 2; }
     [[ "$JOBS" =~ ^[0-9]+$ ]] || { err "jobs must be a number"; exit 2; }
     [ "$JOBS" -lt 1 ] && JOBS=1
+
+    # Normalize user-supplied exclusions to absolute, no-trailing-slash paths
+    # and fold them into EXCLUDE_PATHS so the find prune expression picks
+    # them up alongside the built-in defaults. OS-level checks never consult
+    # EXCLUDE_PATHS, so this affects only stages 2-5 (per spec).
+    #
+    # NOTE: do NOT canonicalise with readlink/realpath -- `find` emits paths
+    # using whatever prefix the start directory had, so resolving symlinks
+    # (e.g. /tmp -> /private/tmp on macOS) would break the prune match.
+    # Both forms get added so either the symlinked or canonical layout works.
+    local i raw abs canon
+    for i in "${!USER_EXCLUDE_PATHS[@]}"; do
+        raw="${USER_EXCLUDE_PATHS[$i]}"
+        # Relative -> absolute, no symlink resolution.
+        case "$raw" in
+            /*) abs="$raw" ;;
+            *)  abs="$(pwd)/$raw" ;;
+        esac
+        [ "${#abs}" -gt 1 ] && abs="${abs%/}"
+        USER_EXCLUDE_PATHS[$i]="$abs"
+        EXCLUDE_PATHS+=("$abs")
+        # Also add the canonical (symlink-resolved) form as a fallback so
+        # users who pass either /tmp/foo or /private/tmp/foo see the prune
+        # work, regardless of which form `find` is walking.
+        canon=$(readlink -f -- "$abs" 2>/dev/null)
+        if [ -n "$canon" ] && [ "$canon" != "$abs" ]; then
+            [ "${#canon}" -gt 1 ] && canon="${canon%/}"
+            EXCLUDE_PATHS+=("$canon")
+        fi
+    done
 }
 
 # ============================================================================
@@ -1463,6 +1502,14 @@ main() {
         info "Size cap: skipping files larger than ${W}${MAX_FILE_SIZE_MB} MB${NC}  (use -m N to change, --no-size-limit to disable)"
     else
         warn "Size cap disabled (--no-size-limit) — every readable file will be inspected."
+    fi
+
+    if [ "${#USER_EXCLUDE_PATHS[@]}" -gt 0 ]; then
+        info "User exclusions (${W}${#USER_EXCLUDE_PATHS[@]}${NC}) — skipped during stages 2-5, not stage 1:"
+        local p
+        for p in "${USER_EXCLUDE_PATHS[@]}"; do
+            printf '       %b- %s%b\n' "$D" "$p" "$NC" >&2
+        done
     fi
 
     if [ "$SKIP_SYSTEM" -eq 0 ]; then
