@@ -9,10 +9,6 @@
  ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
 ```
 
-### Reusable-credential discovery for authorized post-exploitation
-
-*Read-only. No network. One Bash script for Linux. One PowerShell script for Windows.*
-
 `v2.1.0`  ·  `bash 4+`  ·  `PowerShell 5.1+`  ·  `pentest · red team · CTF · privilege escalation`
 
 </div>
