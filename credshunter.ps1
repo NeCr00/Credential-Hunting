@@ -39,7 +39,22 @@
     Append a plain-text log of all findings.
 
 .PARAMETER SkipSystem
+    Skip stage 1 (OS-level credential checks). Alias for -NoStage1.
+
+.PARAMETER NoStage1
     Skip stage 1 (OS-level credential checks).
+
+.PARAMETER NoStage2
+    Skip stage 2 (confirmed credential containers).
+
+.PARAMETER NoStage3
+    Skip stage 3 (high-value file types).
+
+.PARAMETER NoStage4
+    Skip stage 4 (filename substring search).
+
+.PARAMETER NoStage5
+    Skip stage 5 (recursive content scan).
 
 .PARAMETER Quiet
     Reduce status noise. Findings still printed.
@@ -78,15 +93,35 @@ param(
     [string] $OutputFile,
 
     [switch] $SkipSystem,
+    [switch] $NoStage1,
+    [switch] $NoStage2,
+    [switch] $NoStage3,
+    [switch] $NoStage4,
+    [switch] $NoStage5,
 
     [switch] $Quiet,
 
-    [switch] $NoColor
+    [switch] $NoColor,
+
+    [Alias('h','?')]
+    [switch] $Help
 )
+
+if ($Help) {
+    if ($PSCommandPath) { Get-Help $PSCommandPath -Full } else { Get-Help $MyInvocation.MyCommand.Path -Full }
+    exit 0
+}
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'Continue'
 $script:Version        = '2.0.0'
+
+# Stage-skip booleans: -SkipSystem is the legacy alias for -NoStage1.
+$script:Stage1Skip = $SkipSystem.IsPresent -or $NoStage1.IsPresent
+$script:Stage2Skip = $NoStage2.IsPresent
+$script:Stage3Skip = $NoStage3.IsPresent
+$script:Stage4Skip = $NoStage4.IsPresent
+$script:Stage5Skip = $NoStage5.IsPresent
 
 # Resolve our own path so we never scan ourselves
 $script:SelfPath = $null
@@ -151,6 +186,13 @@ $script:SkippedFiles     = [System.Collections.Generic.List[object]]::new()
 $script:FindingHashes    = [System.Collections.Generic.HashSet[string]]::new()
 $script:InterestingHashes = [System.Collections.Generic.HashSet[string]]::new()
 $script:ScannedPaths     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+# Stage-1 live-output state. When InStage1 is true, the Add-* helpers stream
+# each finding to the host as it is recorded so the operator sees results in
+# real time. SubstageFindings is reset before each substage runs; if it is
+# still 0 when the substage returns, a "no credentials found" line is shown.
+$script:InStage1         = $false
+$script:SubstageFindings = 0
 
 # ============================================================================
 #  Pattern data - PASSWORD-FOCUSED for lateral movement / priv-esc
@@ -220,8 +262,28 @@ $script:RawPatterns = @(
        Regex = '(?i)plink(\.exe)?\s.*-pw\s+["'']?[^\s''"]{2,}' }
     @{ Label = 'net_use_pass';
        Regex = '(?i)net\s+use\s+\\\\\S+\s+\S+\s+/user:\S+' }
-    @{ Label = 'net_user_add';
-       Regex = '(?i)net\s+user\s+\S+\s+[^\s/]{4,}\s+(/add|/domain)' }
+    # `net user john.doe "MySecurePassword" /domain` — the classic Windows
+    # admin-paste-into-script pattern (HTB writeups, real engagements).
+    @{ Label = 'net_user_create';
+       Regex = '(?i)net\s+user\s+\S+\s+["'']?[^\s"'']{3,}["'']?\s+(/add|/domain|/passwordreq|/active|/expires)' }
+    # PowerShell local-user / AD password cmdlets — common in deploy scripts
+    @{ Label = 'ps_localuser_pass';
+       Regex = '(?i)(New-LocalUser|Add-LocalUser|Set-LocalUser)\s.*-(Password|AccountPassword)\s+["''][^"'']{3,}["'']' }
+    @{ Label = 'ps_ad_password';
+       Regex = '(?i)(Set-ADAccountPassword|New-ADUser)\s.*-(AccountPassword|NewPassword)\s' }
+    @{ Label = 'ps_secstring_plain';
+       Regex = '(?i)ConvertTo-SecureString\s+["''][^"'']{3,}["'']\s+-AsPlainText\s+-Force' }
+    @{ Label = 'net_user_create';
+       Regex = '(?i)net\s+user\s+\S+\s+["'']?[^\s"'']{3,}["'']?\s+(/add|/domain|/passwordreq|/active|/expires)' }
+    # Linux user-creation in shell scripts (HTB / OSCP staples)
+    @{ Label = 'useradd_pass';
+       Regex = '(?i)useradd\s.*-p\s+["'']?[^\s"'']{3,}' }
+    @{ Label = 'chpasswd_inline';
+       Regex = '(?i)(echo|printf)\s+["'']?[^:\s]+:[^\s"'']{3,}["'']?\s*\|\s*chpasswd' }
+    @{ Label = 'chpasswd_heredoc';
+       Regex = '(?i)chpasswd\s*<<<?\s*["'']?[^:\s]+:[^\s"'']{3,}' }
+    @{ Label = 'passwd_stdin';
+       Regex = '(?i)(echo|printf)\s+["''][^"'']{3,}["'']\s*\|\s*passwd\s+\S+(\s+--stdin)?' }
     @{ Label = 'ldap_pass';
        Regex = '(?i)(ldapsearch|ldapadd|ldapmodify|ldapdelete|ldapcompare)\s.*-w\s+["'']?[^\s''"]{2,}' }
     @{ Label = 'rsync_pass';
@@ -274,6 +336,12 @@ $script:RawPatterns = @(
        Regex = '(?im)^\s*(machine\s+\S+\s+)?(login|user|username)\s+\S+\s+password\s+\S{2,}' }
     @{ Label = 'samba_password';
        Regex = '(?im)^\s*(passwd|password|smb\s+passwd)\s*=\s*\S{3,}' }
+
+    # ---- Specific config-file credential formats ---------------------------
+    @{ Label = 'redis_requirepass';
+       Regex = '(?im)^\s*requirepass\s+\S{3,}' }
+    @{ Label = 'anaconda_rootpw';
+       Regex = '(?im)^\s*(rootpw|user)\s.*(--plaintext\s+|--password=)[^\s"#]{3,}' }
 
     # ---- Hash dumps (pass-the-hash / cracking) -----------------------------
     @{ Label = 'ntlm_dump';
@@ -328,8 +396,23 @@ $script:NoFPCheck = @(
     'ntlm_dump','ntds_dump','gpp_cpassword',
     'htpasswd_hash','shadow_md5','shadow_sha256','shadow_sha512',
     'shadow_yescrypt','shadow_bcrypt','shadow_argon2',
-    'krb5_tgs','krb5_asrep','mscash_v1','mscash_v2'
+    'krb5_tgs','krb5_asrep','mscash_v1','mscash_v2',
+    # Format-anchored patterns where the matched line IS the credential
+    'unattend_password','autologon_password',
+    'netrc_password','sudoers_nopasswd','samba_password',
+    'wp_db_password','joomla_password','drupal_password',
+    'redis_requirepass','anaconda_rootpw'
 )
+
+# Fast keyword pre-filter. Run as a single compiled-regex IsMatch() against
+# the whole file content before the expensive per-pattern pass. If the file
+# contains NONE of these anchor keywords, no credential pattern can fire
+# (except KEY patterns, which we always check). This single-pass filter
+# eliminates 80-95% of files instantly and is the single biggest perf win
+# on large trees with lots of license/doc/boilerplate text files.
+$script:KeywordPrefilter = [regex]::new(
+    '(?i)password|passwd|passphrase|pwd|cpassword|sshpass|kerberos|krb5(tgs|asrep)|\$DCC2\$|\$apr1\$|\$1\$[A-Za-z0-9./]{8}\$|\$2[aby]?\$|\$5\$[A-Za-z0-9./]{1,16}\$|\$6\$[A-Za-z0-9./]{1,16}\$|\$y\$|\$argon2|mongodb://|mysql://|postgres(?:ql)?://|redis://|jdbc:|PGPASSWORD|MYSQL_PWD|\bsudoers\b|NOPASSWD|wp-config|configuration\.php|appsettings\.json|web\.config|tomcat-users|cmdkey|runas\s+/|psexec|smbclient\s|net\s+use\s|wmic\s|/p:|/pass:|/password:',
+    [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 # ============================================================================
 #  False-positive filter
@@ -368,6 +451,9 @@ function Test-FalsePositive { param([string]$Value)
     # Suffix-based template placeholders (e.g. MY_DB_PASSWORD as var name)
     if ($lower -match '_(password|secret|token|key|pass|pwd|passwordhere)$') { return $true }
     if ($lower -match '^(your|insert|replace|example|sample|test|my|fake)_')  { return $true }
+    # Trailing marker words — values that self-label as placeholders
+    if ($lower -match '(placeholder|placeholders)$')                          { return $true }
+    if ($lower -match '_(example|sample|dummy|mock|stub|fake|demo)$')         { return $true }
 
     # Template / interpolation markers
     if ($v -match '\$\{[^}]+\}')                  { return $true }
@@ -407,11 +493,17 @@ function Test-FalsePositive { param([string]$Value)
 }
 
 # ============================================================================
-#  Filename / extension data
+#  USER-CUSTOMIZABLE PATTERN LISTS
+#
+#  Edit the arrays below to add or remove what each stage flags. NO OTHER
+#  changes are required when you tweak these.
+#
+#  All matching is case-insensitive. Stage 2/3 match extensions / names;
+#  Stage 4 uses substring match on the basename.
 # ============================================================================
 
-# Stage 2: confirmed credential containers
-$script:GuaranteedCredExtensions = @(
+# -- Stage 2 -- confirmed credential containers (match alone = [CRITICAL]) ----
+$script:Stage2Extensions = @(
     '.kdbx','.kdb','.psafe3'
     '.agilekeychain','.opvault','.1pif','.1pux'
     '.lpdb','.enpass','.enpassdb','.bitwarden_export'
@@ -420,117 +512,74 @@ $script:GuaranteedCredExtensions = @(
     '.bek','.fve','.keytab','.dpapimk'
 )
 
-# Stage 3: auxiliary / ambiguous credential-related files
-$script:HighValueExtensions = @(
-    '.pem','.key','.priv','.asc','.gpg','.wallet'
-    '.rdp','.ovpn'
-    # Session managers / VPN profiles (DPAPI-encrypted but worth flagging)
-    '.rdg','.rdcman','.rtsz','.rtsg','.remmina','.pcf','.tblk'
-    # VMware Workstation .vmx files have `displayName.passwd`, `encoded.password`
-    '.vmx'
-    # Outlook archives — admin pw emails archived here
-    '.pst','.ost'
-    # Office docs
-    '.doc','.docx','.docm','.dot','.dotx','.dotm'
-    '.xls','.xlsx','.xlsm','.xlsb','.xlt','.xltx','.xltm'
-    '.ppt','.pptx','.pptm','.pps','.ppsx'
-    '.odt','.ods','.odp','.odg','.pdf'
-    '.one','.onetoc2'
-    # Binary databases
-    '.mdb','.accdb','.bacpac','.dacpac'
-    '.mdf','.ldf','.frm','.myd'
-    '.sqlite','.sqlite3','.db','.db3'
-    # Registry hives & memory dumps
-    '.hive','.hiv','.dmp','.mdmp','.crash','.core'
+# -- Stage 3 -- high-value file types (match = [INTEREST]) -------------------
+# Three sub-arrays drive the Stage 3 detector: extensions, exact filenames,
+# and globs. A file matched by ANY of the three is flagged.
+$script:Stage3Extensions = @(
+    # SSH / TLS private key formats
+    '.pem','.key','.priv','.crt','.cer','.csr'
+    # App-secret dotfile extensions
+    '.env','.envrc'
+    # Kerberos (also in $script:Stage2Extensions -- Stage 3 runtime dedups
+    # against Stage 2 findings, harmless duplication kept for discoverability)
+    '.keytab'
+    # Shell scripts
+    '.sh','.bash'
+    # Backup / scratch / saved variants
+    '.bak','.old','.orig','.backup','.swp','.save'
+    # SQLite databases (system DB basenames filtered separately, see SkipDbFilenames)
+    '.db','.sqlite','.sqlite3'
+    # Logs (admins sometimes paste pw into custom logs)
+    '.log'
+    # Packet captures (may contain plaintext auth)
+    '.pcap','.pcapng'
+    # Compressed archives (admin backups often contain creds)
+    '.tar','.tgz','.gz','.zip','.7z'
 )
 
-# Stage 4a: exact filename matches
-$script:CredFileNames = @(
-    '.bash_history','.zsh_history','.sh_history','.ksh_history','.history','.ash_history'
-    '.psql_history','.mysql_history','.sqlite_history','.python_history'
-    '.node_repl_history','.irb_history','.rediscli_history','.lesshst','.viminfo'
-    '.wget-hsts'
-    '.netrc','.pgpass','.my.cnf','my.cnf','.mysql.cnf','.dbshell','.mongorc.js'
-    '.pypirc','.npmrc','.gitconfig','.git-credentials','.gitcredentials'
-    '.htpasswd','.htaccess','shadow','gshadow','passwd','sudoers','master.passwd'
-    'login.defs','auth.log','secure','pam.conf','smb.conf','smbpasswd','freerdp'
-    'wgetrc','.wgetrc','curlrc','.curlrc'
-    'id_rsa','id_dsa','id_ecdsa','id_ed25519','id_xmss'
-    'authorized_keys','authorized_keys2','known_hosts','ssh_config','sshd_config'
-    'sam','system','security','software','ntuser.dat','ntds.dit'
-    'system.sav','security.sav','sam.sav'
-    'unattend.xml','unattended.xml','autounattend.xml','sysprep.xml','sysprep.inf'
-    'groups.xml','services.xml','scheduledtasks.xml','datasources.xml','printers.xml','drives.xml'
-    'web.config','wp-config.php','wp-config.bak','wp-config.old'
-    'wp-config.php.bak','wp-config.php.old','wp-config.php.save'
-    'configuration.php','settings.php','local.xml','config.inc.php','config.php'
-    'db.php','database.php','connect.php','connection.php'
-    'appsettings.json','appsettings.production.json','appsettings.development.json'
-    'connection.config','machine.config','hibernate.cfg.xml','persistence.xml'
-    'context.xml','tomcat-users.xml','standalone.xml','server.xml'
-    'mgmt-users.properties','application.properties','application.yml','application.yaml'
-    'bootstrap.yml','bootstrap.yaml'
-    'pg_hba.conf','postgresql.conf','my.ini','mongod.conf','redis.conf'
-    'elasticsearch.yml','kibana.yml','tnsnames.ora','sqlnet.ora','listener.ora','wallet.dat'
-    'winscp.ini','putty.reg','sitemanager.xml','recentservers.xml'
-    'filezilla.xml','queue.xml','confcons.xml','mremoteng.xml','default.rdg','rdcman.settings'
-    '.env','.env.local','.env.dev','.env.development','.env.prod','.env.production'
-    '.env.staging','.env.test','.env.backup','.env.bak','.env.old','.env.save'
-    '.env.example','.env.sample','env.production','env.development'
-    '.vault_pass','vault_pass.txt','.ansible_vault'
-
-    # Research adds (HTB/THM/PG + real-engagement staples)
-    'tomcat-users.xml'              # Tomcat manager
-    'credentials.xml'               # Jenkins $JENKINS_HOME
-    'master.key','secret.key'       # Jenkins secrets/
-    'hudson.util.secret'            # Jenkins encrypted secret
-    'sitelist.xml'                  # McAfee
-    'applicationhost.config'        # IIS
-    'keepass.config.xml','keepass.config.enforced.xml'
-    'grafana.ini','gitlab.rb','app.ini'
-    'accounts.xml'                  # Pidgin
-    'secrets.tdb'                   # Samba
-    'user-data.txt','cloud-config'
-    'ks.cfg','initial-setup-ks.cfg','preseed.cfg'
-    'opasswd','sssd.conf'
-    'confcons.xml','rdcman.settings'
-    'wp-config.php~','wp-config.php.swp'   # editor scratch
+# Exact filename matches (names that cannot be expressed as a simple *.ext glob)
+$script:Stage3ExactNames = @(
+    'krb5.conf'
+    '.htpasswd','.netrc','.pgpass','.my.cnf','my.cnf','.mysql.cnf'
 )
-$script:CredFileNamesSet = [System.Collections.Generic.HashSet[string]]::new(
-    [string[]]$script:CredFileNames, [System.StringComparer]::OrdinalIgnoreCase)
+$script:Stage3ExactNamesSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:Stage3ExactNames, [System.StringComparer]::OrdinalIgnoreCase)
 
-# Stage 4b: substring patterns (case-insensitive)
-$script:SuspiciousNamePatterns = @(
-    'password','passwd','pwd','passphrase','passcode'
-    'credential','creds','vault','secret'
-    'htpasswd','netrc','pgpass'
-    'db_pass','database_password','dbpass'
-    'masterkey','master_password','masterpass','sshpass'
-    'pwdump','kerberoast','asreproast','hashdump','mimikatz','lsass'
-    'keepass'
-    'sshkey','ssh_key','sshconfig','ssh_config'
-    'winscp','putty','filezilla','mremoteng','rdcman'
-    'ansible_vault','vault_pass'
-    'smbpasswd','autologon'
-    'unattend','sysprep','autounattend'
-    'wp_config','wp-config','wpconfig'
-
-    # ── Research-derived adds (Snaffler classifiers, 0xdf writeups,
-    #    BHIS file-share triage) ───────────────────────────────────
-    'handover','onboarding','offboarding','newhire','helpdesk','runbook'
-    'as-built','build sheet','buildsheet'
-    'new hire','new_hire'
-    'reset_password','reset password','password_recovery','password_reset'
-    'it_master','it master'
-    'domain_admin','domain admin'
-    'service_account','service account','svc_account','svcaccount','svcacct'
-    'domain_join','local_admin','break_glass','breakglass'
-    'default_password','defaultpass'
-    'snmp_community'
+# Glob patterns (PowerShell -like syntax). Note: '*.tar.gz' is covered by
+# the '.gz' entry above, but kept here so users can toggle tarball handling
+# independently of raw .gz.
+$script:Stage3GlobPatterns = @(
+    'krb5cc_*'
+    '*.tar.gz'
+    '.env.*'
 )
 
-# Stage 5: content-search extensions
-$script:SearchExtensions = @(
+# Known SQL Server SYSTEM / TEMPLATE database basenames -- always shipped, never
+# user data. Filtered at Stage 3 [INTEREST] flagging.
+$script:SkipDbFilenames = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@(
+        'master.mdf','mastlog.ldf'
+        'model.mdf','modellog.ldf'
+        'msdb.mdf','msdbdata.mdf','msdblog.ldf'
+        'tempdb.mdf','templog.ldf'
+        'mssqlsystemresource.mdf','mssqlsystemresource.ldf'
+        'model_msdbdata.mdf','model_msdblog.ldf'
+        'model_replicatedmaster.mdf','model_replicatedmaster.ldf'
+    ),
+    [System.StringComparer]::OrdinalIgnoreCase)
+
+# -- Stage 4 -- filename substring tokens (match = [NAME]) -------------------
+# Any filename containing one of these tokens (case-insensitive) is flagged.
+# Keep this list short: each entry is a substring, so loose entries balloon
+# the false-positive rate.
+$script:Stage4NameTokens = @(
+    'credential','secret','pass','password','passwd','account','login'
+)
+
+# -- Stage 5 -- content-scan extension allow-list ----------------------------
+# Recursive credential-pattern scan runs ONLY on files with one of these
+# extensions (unless -All is passed).
+$script:Stage5Extensions = @(
     '.conf','.config','.cfg','.cnf','.ini','.env','.envrc'
     '.yaml','.yml','.toml','.json','.jsonc','.json5'
     '.xml','.plist'
@@ -555,8 +604,53 @@ $script:SearchExtensions = @(
     '.service','.unit','.timer','.socket','.crontab','.cron'
     '.local','.shared','.template','.example','.sample','.dist'
 )
-$script:SearchExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
-    [string[]]$script:SearchExtensions, [System.StringComparer]::OrdinalIgnoreCase)
+$script:Stage5ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:Stage5Extensions, [System.StringComparer]::OrdinalIgnoreCase)
+
+# Fast filename-based skip for cred-free files that match a credential
+# extension (LICENSE.md / package-lock.json / .gitignore / etc.). Skipping
+# at the filename layer avoids per-file stat/grep work on common dev noise.
+$script:SkipFilenames = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@(
+        # License files
+        'LICENSE','LICENSE.txt','LICENSE.md','LICENSE.rst'
+        'LICENCE','LICENCE.txt','LICENCE.md'
+        'UNLICENSE','UNLICENSE.txt'
+        'COPYING','COPYING.txt','COPYRIGHT','COPYRIGHT.txt'
+        # Changelogs
+        'CHANGELOG','CHANGELOG.md','CHANGELOG.txt','CHANGELOG.rst'
+        'CHANGES','CHANGES.md','HISTORY','HISTORY.md'
+        'NEWS','NEWS.md','RELEASE_NOTES','RELEASE_NOTES.md','RELEASES.md'
+        # Project meta docs
+        'AUTHORS','AUTHORS.txt','AUTHORS.md','CONTRIBUTORS','CONTRIBUTORS.md'
+        'MAINTAINERS','MAINTAINERS.md'
+        'CONTRIBUTING','CONTRIBUTING.md','CODE_OF_CONDUCT.md'
+        'NOTICE','NOTICE.txt','NOTICE.md','THIRD_PARTY_NOTICES.txt'
+        'TRADEMARKS.md','ATTRIBUTION.txt'
+        'INSTALL','INSTALL.md','INSTALL.txt','UPGRADE','UPGRADE.md','UPGRADING.md'
+        'SECURITY.md','SUPPORT.md','GOVERNANCE.md','ROADMAP.md'
+        'FUNDING','FUNDING.yml','FUNDING.md'
+        'README','README.md','README.txt','README.rst'
+        # Lockfiles / manifests (no creds)
+        'package.json','package-lock.json','npm-shrinkwrap.json'
+        'yarn.lock','pnpm-lock.yaml','bun.lockb','bun.lock'
+        'Cargo.lock','Gemfile.lock','poetry.lock','composer.lock','composer.json'
+        'go.sum','go.mod','Pipfile.lock'
+        # Build / TS configs
+        'tsconfig.json','jsconfig.json','tslint.json'
+        'Makefile','GNUmakefile','CMakeLists.txt','meson.build'
+        'build.gradle','gradle.properties','pom.xml'
+        'pyproject.toml','setup.cfg','MANIFEST.in','tox.ini','noxfile.py'
+        # VCS / formatter / linter dotfiles
+        '.gitignore','.gitattributes','.editorconfig','.gitmodules','.gitkeep','.mailmap'
+        '.prettierrc','.prettierignore','.prettierrc.json','.prettierrc.yml'
+        '.eslintrc','.eslintignore','.eslintrc.json','.eslintrc.yml','.eslintrc.js'
+        '.stylelintrc','.stylelintrc.json'
+        '.babelrc','.babelrc.json','.browserslistrc','.nvmrc','.node-version','.python-version'
+        '.dockerignore','.npmignore','.ignore'
+        # OS / desktop noise
+        '.DS_Store','Thumbs.db','desktop.ini'
+    ), [System.StringComparer]::OrdinalIgnoreCase)
 
 # Special-cased filenames (no standard extension) we still want to scan in stage 5
 $script:ExtraScanNames = [System.Collections.Generic.HashSet[string]]::new(
@@ -592,26 +686,62 @@ $script:ExcludeDirNames = @(
 $script:ExcludeDirSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:ExcludeDirNames, [System.StringComparer]::OrdinalIgnoreCase)
 
-# Absolute path prefixes
+# Absolute-path prefixes never to descend into during stages 2-5.
+#
+# IMPORTANT: Stage 1 (OS-level checks) uses hardcoded paths and bypasses
+# this list — excluding $env:SystemRoot does NOT prevent Sysprep / GPP /
+# SAM / AutoLogon / IIS / Scheduled Tasks checks from working. It just
+# keeps the stage-5 recursive scanner from burning cycles on the 100k+
+# system files under C:\Windows that never carry credentials.
 $script:ExcludePathPrefixes = @(
-    (Join-Path $env:SystemRoot 'WinSxS')
-    (Join-Path $env:SystemRoot 'Installer')
-    (Join-Path $env:SystemRoot 'SoftwareDistribution')
-    (Join-Path $env:SystemRoot 'Logs')
-    (Join-Path $env:SystemRoot 'LiveKernelReports')
-    (Join-Path $env:SystemRoot 'servicing')
-    (Join-Path $env:SystemRoot 'assembly')
-    (Join-Path $env:SystemRoot 'Microsoft.NET\assembly')
-    (Join-Path $env:SystemRoot 'Fonts')
-    (Join-Path $env:SystemRoot 'Help')
-    (Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v2.0.50727')
-    (Join-Path $env:SystemRoot 'PolicyDefinitions')
+    # Entire C:\Windows tree — system DLLs, drivers, components, fonts.
+    $env:SystemRoot
+    # AppX / MSIX package store
     (Join-Path ${env:ProgramFiles} 'WindowsApps')
     (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps')
     (Join-Path $env:LOCALAPPDATA 'Packages')
+    # Recycle / restore / perf data
     "$env:SystemDrive\`$Recycle.Bin"
     "$env:SystemDrive\System Volume Information"
+    "$env:SystemDrive\PerfLogs"
+    # ── Microsoft SQL Server install trees (binaries + system DBs + install
+    #    scripts + setup logs). User databases live in custom dirs like
+    #    D:\Data, not under Program Files. Skipping the product dir cuts
+    #    huge noise from instmsdb.sql / msdb110_upgrade.sql / Setup Bootstrap
+    #    logs which contain SQL-parameter-reference noise.
+    (Join-Path ${env:ProgramFiles} 'Microsoft SQL Server')
+    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft SQL Server')
+    # ── ProgramData noise (Windows update cache, identity CRL, breadcrumbs)
+    (Join-Path $env:ProgramData 'Microsoft\Windows\Caches')
+    (Join-Path $env:ProgramData 'USOPrivate')
+    (Join-Path $env:ProgramData 'USOShared')
+    (Join-Path $env:ProgramData 'Microsoft\IdentityCRL')
+    (Join-Path $env:ProgramData 'Microsoft\Device Stage')
+    (Join-Path $env:ProgramData 'Microsoft\NetFramework\BreadcrumbStore')
+    (Join-Path $env:ProgramData 'Microsoft\EdgeUpdate\Log')
 ) | Where-Object { $_ -and $_.Trim() -ne '' }
+
+# Path-substring exclusions — used when the noisy directory lives at a
+# per-user path that can't be expressed as a single absolute prefix
+# (e.g. C:\Users\<every-user>\AppData\Local\Microsoft\Windows\Caches).
+# Compared case-insensitively against the full directory path via Contains.
+$script:ExcludePathContains = @(
+    '\AppData\Local\Microsoft\Windows\Caches'
+    '\AppData\Local\Microsoft\Windows\Explorer'      # iconcache / thumbcache
+    '\AppData\Local\Microsoft\Windows\Notifications' # wpndatabase
+    '\AppData\Local\ConnectedDevicesPlatform'        # ActivitiesCache
+    '\AppData\Local\Microsoft\Edge\User Data\Default\Cache'
+    '\AppData\Local\Microsoft\Edge\User Data\Default\Code Cache'
+    '\AppData\Local\Microsoft\Edge\User Data\Default\GPUCache'
+    '\AppData\Local\Microsoft\Edge\User Data\Default\ShaderCache'
+    '\AppData\Local\Microsoft\Edge\User Data\Default\Service Worker'
+    '\AppData\Local\Microsoft\Edge\User Data\BrowserMetrics'
+    '\AppData\Local\Microsoft\Edge\User Data\Crashpad'
+    '\AppData\Local\Microsoft\Edge\User Data\ShaderCache'
+    '\AppData\Local\Google\Chrome\User Data\Default\Cache'
+    '\AppData\Local\Google\Chrome\User Data\Default\Code Cache'
+    '\AppData\Roaming\Microsoft\NetFramework\BreadcrumbStore'
+)
 
 if ($script:UserExcludePaths.Count -gt 0) {
     $script:ExcludePathPrefixes = @($script:ExcludePathPrefixes) + $script:UserExcludePaths
@@ -639,10 +769,127 @@ function Write-Ok   { param([string]$Msg) if (-not $Quiet) { Write-Host "$($scri
 function Write-Warn { param([string]$Msg) Write-Host "$($script:CY)[!]$($script:CNC) $Msg" }
 function Write-Err  { param([string]$Msg) Write-Host "$($script:CR)[x]$($script:CNC) $Msg" }
 
+# Stream a single Stage-1 finding to the host as it is recorded.
+function Write-Stage1Finding {
+    param(
+        [string]$Tier,
+        [string]$Label,
+        [string]$Path,
+        [int]   $LineNumber = 0
+    )
+    if ($Quiet) { return }
+    switch ($Tier) {
+        'Critical' { $color = $script:CR; $tag = 'CRITICAL' }
+        'High'     { $color = $script:CR; $tag = 'HIGH' }
+        'Key'      { $color = $script:CM; $tag = 'KEY' }
+        'Interest' { $color = $script:CY; $tag = 'INTEREST' }
+        'CredFile' { $color = $script:CY; $tag = 'CRED_FILE' }
+        'Name'     { $color = $script:CY; $tag = 'NAME' }
+        default    { $color = $script:CR; $tag = $Tier.ToUpper() }
+    }
+    if ($LineNumber -gt 0) {
+        Write-Host ("{0}   └─ [{1}]{2} {3} → {4}:{5}" -f $color, $tag, $script:CNC, $Label, $Path, $LineNumber)
+    } else {
+        Write-Host ("{0}   └─ [{1}]{2} {3} → {4}" -f $color, $tag, $script:CNC, $Label, $Path)
+    }
+    $script:SubstageFindings++
+}
+
+# Wrapper: run a Stage-1 substage and print a tidy "nothing here" line if
+# the substage produced zero findings. Keeps every Test-* function
+# untouched — they only need to call Add-Finding / Add-Interesting / etc.
+function Invoke-Stage1Check {
+    param([scriptblock]$Block)
+    $script:SubstageFindings = 0
+    & $Block
+    if ($script:SubstageFindings -eq 0 -and -not $Quiet) {
+        Write-Host ("{0}   └─ no credentials found in this category{1}" -f $script:CD, $script:CNC)
+    }
+}
+
 function Write-LogLine { param([string]$Line)
     if ([string]::IsNullOrEmpty($script:LogPath)) { return }
     $clean = $Line -replace "`e\[[0-9;]*m", ''
     Add-Content -Path $script:LogPath -Value $clean -Encoding UTF8
+}
+
+# ============================================================================
+#  Stage lifecycle -- per-stage timing, skip-gating, and live-results block
+# ============================================================================
+
+$script:StageBeforeCounts = @{}
+$script:StageStartTime    = @{}
+
+function Begin-Stage { param([int]$N)
+    $script:StageBeforeCounts[$N] = @{
+        Guaranteed = $script:Guaranteed.Count
+        High       = $script:HighFindings.Count
+        Key        = $script:KeyFindings.Count
+        Interest   = $script:Interesting.Count
+        Cred       = $script:CredFiles.Count
+        Name       = $script:SuspiciousNamesFound.Count
+    }
+    $script:StageStartTime[$N] = [DateTime]::UtcNow
+}
+
+function End-Stage { param([int]$N, [string]$Title)
+    $before = $script:StageBeforeCounts[$N]
+    $elapsed = ([DateTime]::UtcNow - $script:StageStartTime[$N]).TotalSeconds
+    $dGuar = $script:Guaranteed.Count           - $before.Guaranteed
+    $dHigh = $script:HighFindings.Count         - $before.High
+    $dKey  = $script:KeyFindings.Count          - $before.Key
+    $dInt  = $script:Interesting.Count          - $before.Interest
+    $dCred = $script:CredFiles.Count            - $before.Cred
+    $dName = $script:SuspiciousNamesFound.Count - $before.Name
+    $total = $dGuar + $dHigh + $dKey + $dInt + $dCred + $dName
+
+    Write-Host ""
+    Write-Host "$($script:CC)======================================================================$($script:CNC)"
+    Write-Host "$($script:CBold)  Stage $N - $Title$($script:CNC)"
+    Write-Host "$($script:CC)----------------------------------------------------------------------$($script:CNC)"
+    Write-Host ("  Found: $($script:CW)$($script:CBold){0}$($script:CNC) file(s)   ({1:N2}s)" -f $total, $elapsed)
+
+    if (-not $Quiet -and $total -gt 0) {
+        Write-Host ""
+        if ($dGuar -gt 0) {
+            $script:Guaranteed | Select-Object -Last $dGuar | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'CRITICAL', $_.Path)
+            }
+        }
+        if ($dHigh -gt 0) {
+            $script:HighFindings | Select-Object -Last $dHigh | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'HIGH', $_.Path)
+            }
+        }
+        if ($dKey -gt 0) {
+            $script:KeyFindings | Select-Object -Last $dKey | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'KEY', $_.Path)
+            }
+        }
+        if ($dInt -gt 0) {
+            $script:Interesting | Select-Object -Last $dInt | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'INTEREST', $_.Path)
+            }
+        }
+        if ($dCred -gt 0) {
+            $script:CredFiles | Select-Object -Last $dCred | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'CRED_FILE', $_)
+            }
+        }
+        if ($dName -gt 0) {
+            $script:SuspiciousNamesFound | Select-Object -Last $dName | ForEach-Object {
+                Write-Host ("  [{0,-9}]  {1}" -f 'NAME', $_)
+            }
+        }
+    }
+    Write-Host "$($script:CC)======================================================================$($script:CNC)"
+}
+
+function Stage-Skipped { param([int]$N, [string]$Title)
+    Write-Host ""
+    Write-Host "$($script:CC)======================================================================$($script:CNC)"
+    Write-Host "$($script:CBold)  Stage $N - $Title  [SKIPPED]$($script:CNC)"
+    Write-Host "$($script:CC)======================================================================$($script:CNC)"
 }
 
 # ============================================================================
@@ -676,6 +923,12 @@ function Test-DirectoryExcluded { param([string]$DirectoryPath)
         foreach ($prefix in $script:ExcludePathPrefixes) {
             if (-not $prefix) { continue }
             if ($DirectoryPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        # Path-substring patterns (per-user paths can't use simple prefixes)
+        foreach ($needle in $script:ExcludePathContains) {
+            if ($DirectoryPath.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 return $true
             }
         }
@@ -721,24 +974,43 @@ function Add-Finding {
         'High' { $script:HighFindings.Add($obj) }
         'Key'  { $script:KeyFindings.Add($obj)  }
     }
+    if ($script:InStage1) {
+        Write-Stage1Finding -Tier $Bucket -Label $Label -Path $Path -LineNumber $LineNumber
+    }
 }
 
 function Add-Interesting { param([string]$Category, [string]$Path)
     $k = "$Category|$Path"
     if ($script:InterestingHashes.Add($k)) {
         $script:Interesting.Add([PSCustomObject]@{ Category = $Category; Path = $Path })
+        if ($script:InStage1) {
+            Write-Stage1Finding -Tier 'Interest' -Label $Category -Path $Path
+        }
     }
 }
 function Add-Guaranteed { param([string]$Extension, [string]$Path)
     if ($script:GuaranteedHashes.Add($Path)) {
         $script:Guaranteed.Add([PSCustomObject]@{ Extension = $Extension; Path = $Path })
+        if ($script:InStage1) {
+            Write-Stage1Finding -Tier 'Critical' -Label $Extension -Path $Path
+        }
     }
 }
 function Add-CredFile { param([string]$Path)
-    if ($script:CredFileHashes.Add($Path)) { $script:CredFiles.Add($Path) | Out-Null }
+    if ($script:CredFileHashes.Add($Path)) {
+        $script:CredFiles.Add($Path) | Out-Null
+        if ($script:InStage1) {
+            Write-Stage1Finding -Tier 'CredFile' -Label 'exact_name' -Path $Path
+        }
+    }
 }
 function Add-SuspiciousName { param([string]$Path)
-    if ($script:NameHashes.Add($Path)) { $script:SuspiciousNamesFound.Add($Path) | Out-Null }
+    if ($script:NameHashes.Add($Path)) {
+        $script:SuspiciousNamesFound.Add($Path) | Out-Null
+        if ($script:InStage1) {
+            Write-Stage1Finding -Tier 'Name' -Label 'name_match' -Path $Path
+        }
+    }
 }
 function Add-Checked { param([string]$Label, [string]$Path)
     $k = "$Label|$Path"
@@ -755,13 +1027,42 @@ function Add-Skipped { param([string]$Path, [string]$Reason)
 # ============================================================================
 
 # Single file scan. Used by both stage 1 (OS checks) and stage 5 (recursive).
-# Each path is processed at most once via $ScannedPaths.
+#
+# Performance design:
+#   1. Cheap I/O + binary + size gate.
+#   2. ONE compiled-regex pre-filter on the whole file. If no credential
+#      anchor keyword appears anywhere, only the (always-cheap) private-key
+#      header check runs. This kills 80-95% of files instantly and is what
+#      makes scanning C:\ feasible -- license/doc/boilerplate text files
+#      otherwise burn minutes on backtracking.
+#   3. LINE-BY-LINE pattern evaluation for files that pass the pre-filter.
+#      Each pattern runs against a single bounded-length line, so
+#      catastrophic backtracking is impossible.
+#   4. First pattern that matches a line wins (one finding per line).
+#   5. Skip pathologically long lines (>2 KB) -- they're minified JS,
+#      base64 blobs, or log rotations, never credential assignments.
 function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'content')
-    # Never scan ourselves
     if ($script:SelfPath -and $FullPath -eq $script:SelfPath) { return }
-
-    # Dedup
     if (-not $script:ScannedPaths.Add($FullPath)) { return }
+
+    # Cheap filename-based skip BEFORE any I/O: LICENSE, CHANGELOG, package-lock,
+    # README, .gitignore, etc. all match credential extensions but never contain
+    # reusable credentials. Skipping here saves a stat, a binary check, and a
+    # regex pass per file on every dev-style repo.
+    $bn = [System.IO.Path]::GetFileName($FullPath)
+    if ($script:SkipFilenames.Contains($bn)) {
+        Add-Skipped -Path $FullPath -Reason 'non-credential filename'
+        return
+    }
+    # Pattern-based skips: minified / bundled / translation / source maps
+    if ($bn -match '\.(min|bundle)\.(js|css)$') {
+        Add-Skipped -Path $FullPath -Reason 'minified asset'; return
+    }
+    if ($bn -match '\.(po|pot|mo)$')  { Add-Skipped -Path $FullPath -Reason 'gettext translation'; return }
+    if ($bn -match '\.map$')          { Add-Skipped -Path $FullPath -Reason 'source map'; return }
+    # .env templates are placeholders by definition — flagged by stage 4 but
+    # we skip their content to avoid <YOUR_PASSWORD>-style false positives.
+    if ($bn -match '\.env\.(example|sample|template|dist)$') { Add-Skipped -Path $FullPath -Reason 'env template'; return }
 
     $size = Get-FileSizeSafe -FullPath $FullPath
     if ($size -lt 0) { Add-Skipped -Path $FullPath -Reason 'unreadable'; return }
@@ -776,7 +1077,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     catch { Add-Skipped -Path $FullPath -Reason 'read_error'; return }
     if ([string]::IsNullOrEmpty($content)) { return }
 
-    # ---- Phase 1: private-key markers ---------------------------------------
+    # ---- Always-on: private-key markers (very fast, format-anchored) --------
     foreach ($p in $script:KeyPatterns) {
         $m = $p.Regex.Match($content)
         if ($m.Success) {
@@ -785,25 +1086,62 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         }
     }
 
-    # ---- Phase 2: credential patterns ---------------------------------------
+    # ---- Pre-filter: if no anchor keyword, skip the expensive pass ----------
+    if (-not $script:KeywordPrefilter.IsMatch($content)) { return }
+
+    # ---- Line-by-line credential-pattern scan -------------------------------
     $matchesFound = 0
-    foreach ($p in $script:CredPatterns) {
+    $lines = $content -split "`r?`n"
+    for ($i = 0; $i -lt $lines.Length; $i++) {
         if ($matchesFound -ge $script:MaxMatchesPerFile) { break }
-        foreach ($m in $p.Regex.Matches($content)) {
-            if ($matchesFound -ge $script:MaxMatchesPerFile) { break }
-            $line  = $m.Value
+        $line = $lines[$i]
+        $llen = $line.Length
+        if ($llen -lt 6 -or $llen -gt 2048) { continue }
+
+        # Cheap per-line keyword check (regex IsMatch on a short string is fast)
+        if (-not $script:KeywordPrefilter.IsMatch($line)) { continue }
+
+        foreach ($p in $script:CredPatterns) {
+            $m = $p.Regex.Match($line)
+            if (-not $m.Success) { continue }
+
+            # ── Smarter value extraction ──────────────────────────────────
+            # The OLD code grabbed the substring after the FIRST `:` or `=` on
+            # the line. That misfires on timestamps ("03:39:54 SVCPASSWORD:
+            # source = Default") where the first `:` is the clock, not the
+            # password operator. Find the password-keyword position first,
+            # then take whatever immediately follows ITS operator.
             $value = $line
-            $eq = $line.IndexOfAny(@(':','='))
-            if ($eq -ge 0 -and $eq -lt $line.Length - 1) {
-                $value = $line.Substring($eq + 1).Trim().Trim('"',"'",' ',';')
+            $kwMatch = [regex]::Match($line,
+                '(?i)(?:password|passwd|passphrase|pwd|cpassword|requirepass|rootpw|cred(?:ential)?s?|secret)\s*[:=]?\s*',
+                [System.Text.RegularExpressions.RegexOptions]::None)
+            if ($kwMatch.Success) {
+                $value = $line.Substring($kwMatch.Index + $kwMatch.Length)
+                $value = $value.Trim().Trim('"', "'", ' ', ';')
                 $value = ($value -split '[#;]')[0]
+                # Cut at the next `, ` or `->` boundary — common log noise
+                # like "key = value, message = ..." would otherwise capture
+                # the whole tail.
+                $value = ($value -split ',\s+|\s+->\s+|\s+message\s*=', 2)[0]
             }
+
+            # ── Hard-coded line-level FP filter (real-host noise) ─────────
+            # SQL parameter references / masked passwords / SQL Telemetry
+            # logs / Microsoft's published Yukon90_ certificate-signing pw.
+            if ($line -match '@password\s*=\s*(@password|N''''|NULL|@\w+\b)') { continue }
+            if ($line -match 'WITH\s+PASSWORD\s*=\s*''Yukon90_''')           { continue }
+            if ($line -match 'PASSWORD\s*=\s*''\*+''')                       { continue }
+            if ($line -match 'SQLTelemetry\s*:\s*Setting')                   { continue }
+            if ($line -match 'SafeSqlCommand.*PASSWORD\s*=\s*''\*+''')       { continue }
+
             if (-not ($script:NoFPCheck -contains $p.Label)) {
                 if (Test-FalsePositive -Value $value) { continue }
             }
-            $lineNo = Get-LineNumber -Content $content -Index $m.Index
-            Add-Finding -Bucket High -Label "$SourceLabel/$($p.Label)" -Path $FullPath -LineNumber $lineNo -Preview (Format-Preview $line)
+
+            Add-Finding -Bucket High -Label "$SourceLabel/$($p.Label)" `
+                -Path $FullPath -LineNumber ($i + 1) -Preview (Format-Preview $line)
             $matchesFound++
+            break    # one classification per line is enough
         }
     }
 }
@@ -1208,7 +1546,11 @@ function Test-RDPSavedSessions {
     foreach ($d in @($env:USERPROFILE, $env:PUBLIC, "$env:SystemDrive\Users")) {
         if (-not (Test-Path -LiteralPath $d)) { continue }
         try {
-            Get-ChildItem -LiteralPath $d -Recurse -Force -Include '*.rdp','*.rdg' -ErrorAction SilentlyContinue |
+            # NOTE: -LiteralPath silently ignores -Include in PowerShell. We
+            # MUST filter explicitly via Where-Object to avoid returning every
+            # file and directory under $d.
+            Get-ChildItem -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer -and $_.Extension -in '.rdp','.rdg' } |
                 Select-Object -First 200 |
                 ForEach-Object {
                     Add-Interesting -Category 'saved_rdp_file' -Path $_.FullName
@@ -1249,10 +1591,10 @@ function Test-RemoteAccessManagers {
             Invoke-ScanFile -FullPath $f -SourceLabel 'devolutions_rdm'
         }
     }
-    # Royal TS
+    # Royal TS — same -LiteralPath + -Include bug fix as above
     try {
-        Get-ChildItem -LiteralPath $env:APPDATA -Recurse -Force `
-            -Include '*.rtsz','*.rtsg' -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $env:APPDATA -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Extension -in '.rtsz','.rtsg' } |
             Select-Object -First 50 |
             ForEach-Object {
                 Add-Interesting -Category 'royal_ts_session' -Path $_.FullName
@@ -1328,31 +1670,31 @@ function Test-IISConfigHistory {
 }
 
 function Invoke-SystemChecks {
-    Write-Section "Stage 1 - OS-level credential locations"
-    Test-RegistryAutoLogon
-    Test-GPPCPassword
-    Test-UnattendedInstall
-    Test-PowerShellHistory
-    Test-CmdkeyVault
-    Test-PuTTYSessions
-    Test-WinSCPSessions
-    Test-VNCRegistry
-    Test-SNMPRegistry
-    Test-SAMHives
-    Test-IISConfigs
-    Test-ScheduledTasks
-    Test-WiFiProfiles
-    Test-McAfeeSiteList
-    Test-BrowserCredFiles
-    Test-CloudCliCredentials
-    Test-SSHKeysWindows
-    Test-RDPSavedSessions
-    Test-RemoteAccessManagers
-    Test-WiFiProfileXmls
-    Test-AutopilotProvisioning
-    Test-StickyNotes
-    Test-IISConfigHistory
-    Write-Ok "Stage 1 complete."
+    $script:InStage1 = $true
+    Invoke-Stage1Check { Test-RegistryAutoLogon }
+    Invoke-Stage1Check { Test-GPPCPassword }
+    Invoke-Stage1Check { Test-UnattendedInstall }
+    Invoke-Stage1Check { Test-PowerShellHistory }
+    Invoke-Stage1Check { Test-CmdkeyVault }
+    Invoke-Stage1Check { Test-PuTTYSessions }
+    Invoke-Stage1Check { Test-WinSCPSessions }
+    Invoke-Stage1Check { Test-VNCRegistry }
+    Invoke-Stage1Check { Test-SNMPRegistry }
+    Invoke-Stage1Check { Test-SAMHives }
+    Invoke-Stage1Check { Test-IISConfigs }
+    Invoke-Stage1Check { Test-ScheduledTasks }
+    Invoke-Stage1Check { Test-WiFiProfiles }
+    Invoke-Stage1Check { Test-McAfeeSiteList }
+    Invoke-Stage1Check { Test-BrowserCredFiles }
+    Invoke-Stage1Check { Test-CloudCliCredentials }
+    Invoke-Stage1Check { Test-SSHKeysWindows }
+    Invoke-Stage1Check { Test-RDPSavedSessions }
+    Invoke-Stage1Check { Test-RemoteAccessManagers }
+    Invoke-Stage1Check { Test-WiFiProfileXmls }
+    Invoke-Stage1Check { Test-AutopilotProvisioning }
+    Invoke-Stage1Check { Test-StickyNotes }
+    Invoke-Stage1Check { Test-IISConfigHistory }
+    $script:InStage1 = $false
 }
 
 # ============================================================================
@@ -1381,7 +1723,7 @@ function Get-CandidateFiles { param([string[]]$Paths, [bool]$AllMode)
                     $include = $false
                     if ($AllMode) {
                         $include = $true
-                    } elseif ($script:SearchExtensionsSet.Contains($ext)) {
+                    } elseif ($script:Stage5ExtensionsSet.Contains($ext)) {
                         $include = $true
                     } elseif ($script:ExtraScanNames.Contains($name)) {
                         $include = $true
@@ -1413,7 +1755,6 @@ function Get-CandidateFiles { param([string[]]$Paths, [bool]$AllMode)
 
 # Stage 2 - confirmed credential containers (extension == proof)
 function Find-GuaranteedCredentials { param([string[]]$Paths)
-    Write-Section "Stage 2 - Confirmed credential containers"
     $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) { if (Test-Path -LiteralPath $r) { $stack.Push($r) } }
@@ -1422,7 +1763,7 @@ function Find-GuaranteedCredentials { param([string[]]$Paths)
         try {
             foreach ($f in [System.IO.Directory]::EnumerateFiles($current)) {
                 $ext = [System.IO.Path]::GetExtension($f).ToLowerInvariant()
-                if ($script:GuaranteedCredExtensions -contains $ext) {
+                if ($script:Stage2Extensions -contains $ext) {
                     Add-Guaranteed -Extension $ext.TrimStart('.') -Path $f
                     $count++
                 }
@@ -1435,16 +1776,15 @@ function Find-GuaranteedCredentials { param([string[]]$Paths)
             }
         } catch {}
     }
-    if ($count -gt 0) {
-        Write-Ok "Found $($script:CR)$($script:CBold)$count$($script:CNC) $($script:CR)confirmed credential container(s)$($script:CNC)."
-    } else {
-        Write-Ok "Found $($script:CW)0$($script:CNC) confirmed credential containers."
-    }
 }
 
-# Stage 3 - auxiliary credential-related files
+# Stage 3 - high-value file types (NEW SPEC)
+# Three passes driven by top-of-file arrays:
+#   $script:Stage3Extensions    -- extension match
+#   $script:Stage3ExactNamesSet -- exact-basename match (HashSet)
+#   $script:Stage3GlobPatterns  -- wildcard match (PowerShell -like)
+# Files already flagged by Stage 2 are deduped via $script:GuaranteedHashes.
 function Find-HighValueFiles { param([string[]]$Paths)
-    Write-Section "Stage 3 - Auxiliary credential-related files"
     $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) { if (Test-Path -LiteralPath $r) { $stack.Push($r) } }
@@ -1452,9 +1792,35 @@ function Find-HighValueFiles { param([string[]]$Paths)
         $current = $stack.Pop()
         try {
             foreach ($f in [System.IO.Directory]::EnumerateFiles($current)) {
+                # Stage 2 dedup
+                if ($script:GuaranteedHashes.Contains($f)) { continue }
+
+                $name = [System.IO.Path]::GetFileName($f)
+                $nameLc = $name.ToLowerInvariant()
                 $ext = [System.IO.Path]::GetExtension($f).ToLowerInvariant()
-                if ($script:HighValueExtensions -contains $ext) {
-                    Add-Interesting -Category 'credential_related' -Path $f
+
+                # SQL Server system-DB filter (always skip)
+                if ($script:SkipDbFilenames.Contains($name)) { continue }
+
+                $matched = $false
+
+                # Pass 1: extension
+                if ($script:Stage3Extensions -contains $ext) { $matched = $true }
+
+                # Pass 2: exact filename
+                if (-not $matched -and $script:Stage3ExactNamesSet.Contains($name)) {
+                    $matched = $true
+                }
+
+                # Pass 3: glob (e.g. krb5cc_*, *.tar.gz)
+                if (-not $matched) {
+                    foreach ($g in $script:Stage3GlobPatterns) {
+                        if ($nameLc -like $g.ToLowerInvariant()) { $matched = $true; break }
+                    }
+                }
+
+                if ($matched) {
+                    Add-Interesting -Category 'high_value_file' -Path $f
                     $count++
                 }
             }
@@ -1466,28 +1832,44 @@ function Find-HighValueFiles { param([string[]]$Paths)
             }
         } catch {}
     }
-    Write-Ok "Found $($script:CW)$count$($script:CNC) auxiliary credential-related file(s)."
 }
 
-# Stage 4 - filename detection (exact + substring, single tree walk)
+# Stage 4 - filename substring search (NEW SPEC)
+# Single pass: any file whose basename contains a token from
+# $script:Stage4NameTokens (case-insensitive) is emitted as a [NAME] finding.
+# Binary executables, libraries, and the scanner's own script are excluded.
+# The exact-filename list from earlier versions is removed -- if you need to
+# detect well-known credential files at non-standard paths, add their
+# identifying substring (e.g. 'rsa', 'shadow', 'history') to
+# $script:Stage4NameTokens at the top of this script.
 function Find-SuspiciousNames { param([string[]]$Paths)
-    Write-Section "Stage 4 - Filename patterns"
+
+    $binaryExts = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@('.dll','.exe','.sys','.ocx','.com','.scr','.drv','.cpl',
+                    '.ax','.efi','.mui','.so','.dylib','.lib','.bin',
+                    '.tlb','.olb','.tlh','.pdb','.ilk','.nupkg'),
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $selfName = if ($script:SelfPath) { [System.IO.Path]::GetFileName($script:SelfPath).ToLowerInvariant() } else { '' }
+
+    $tokens = @($script:Stage4NameTokens | ForEach-Object { $_.ToLowerInvariant() })
+
+    $count = 0
     $stack = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) { if (Test-Path -LiteralPath $r) { $stack.Push($r) } }
     while ($stack.Count -gt 0) {
         $current = $stack.Pop()
         try {
-            foreach ($e in [System.IO.Directory]::EnumerateFileSystemEntries($current)) {
+            foreach ($e in [System.IO.Directory]::EnumerateFiles($current)) {
                 $name = [System.IO.Path]::GetFileName($e).ToLowerInvariant()
-                if ($script:CredFileNamesSet.Contains($name)) {
-                    Add-CredFile -Path $e
-                    continue
-                }
-                foreach ($pat in $script:SuspiciousNamePatterns) {
-                    if ($pat.Contains('*')) {
-                        if ($name -like "*$pat*") { Add-SuspiciousName -Path $e; break }
-                    } elseif ($name.Contains($pat)) {
-                        Add-SuspiciousName -Path $e; break
+                if ($selfName -and $name -eq $selfName) { continue }
+                $ext = [System.IO.Path]::GetExtension($e).ToLowerInvariant()
+                if ($binaryExts.Contains($ext)) { continue }
+
+                foreach ($t in $tokens) {
+                    if ($name.Contains($t)) {
+                        Add-SuspiciousName -Path $e
+                        $count++
+                        break
                     }
                 }
             }
@@ -1499,17 +1881,10 @@ function Find-SuspiciousNames { param([string[]]$Paths)
             }
         } catch {}
     }
-    if ($script:CredFiles.Count -gt 0) {
-        Write-Ok "Found $($script:CR)$($script:CBold)$($script:CredFiles.Count)$($script:CNC) $($script:CR)credential-named file(s)$($script:CNC) (exact)."
-    } else {
-        Write-Ok "Found $($script:CW)0$($script:CNC) credential-named files (exact)."
-    }
-    Write-Ok "Found $($script:CW)$($script:SuspiciousNamesFound.Count)$($script:CNC) suspicious-name pattern match(es)."
 }
 
 # Stage 5 - recursive file-content scan
 function Invoke-UserPathScan { param([string[]]$Paths)
-    Write-Section "Stage 5 - File-content scan"
     if (-not $Paths -or $Paths.Count -eq 0) {
         Write-Warn "No paths provided; skipping content scan."
         return
@@ -1526,16 +1901,19 @@ function Invoke-UserPathScan { param([string[]]$Paths)
     $i = 0
     foreach ($f in $files) {
         $i++
+        # Throttled progress. Truncate long paths so the progress bar doesn't
+        # blow out terminal width with deep SQL Server / WindowsApps paths.
         if (($i % 25) -eq 0 -or $i -eq $total) {
+            $cur = $f
+            if ($cur.Length -gt 70) { $cur = '...' + $cur.Substring($cur.Length - 67) }
             Write-Progress -Activity "Scanning files for credentials" `
                            -Status ("{0} / {1}" -f $i, $total) `
-                           -CurrentOperation $f `
+                           -CurrentOperation $cur `
                            -PercentComplete ([Math]::Min(100, ($i * 100 / $total)))
         }
         Invoke-ScanFile -FullPath $f -SourceLabel 'content'
     }
     Write-Progress -Activity "Scanning files for credentials" -Completed
-    Write-Ok "Scanned $($script:CW)$total$($script:CNC) files."
 }
 
 # ============================================================================
@@ -1698,20 +2076,38 @@ function Invoke-Main {
         }
     }
 
-    if (-not $SkipSystem) {
+    if (-not $script:Stage1Skip) {
+        Begin-Stage 1
         Invoke-SystemChecks
+        End-Stage 1 "OS-level credential checks"
     } else {
-        Write-Warn "Skipping OS-level checks (per -SkipSystem)."
+        Stage-Skipped 1 "OS-level credential checks"
     }
 
     if ($Path.Count -eq 0) {
         Write-Warn "No -Path supplied. Skipping stages 2-5."
         Write-Warn "Tip: pass -Path C:\ to scan everywhere."
     } else {
-        Find-GuaranteedCredentials -Paths $Path
-        Find-HighValueFiles -Paths $Path
-        Find-SuspiciousNames -Paths $Path
-        Invoke-UserPathScan -Paths $Path
+        if (-not $script:Stage2Skip) {
+            Begin-Stage 2; Find-GuaranteedCredentials -Paths $Path; End-Stage 2 "Confirmed credential containers"
+        } else {
+            Stage-Skipped 2 "Confirmed credential containers"
+        }
+        if (-not $script:Stage3Skip) {
+            Begin-Stage 3; Find-HighValueFiles -Paths $Path; End-Stage 3 "High-value file types"
+        } else {
+            Stage-Skipped 3 "High-value file types"
+        }
+        if (-not $script:Stage4Skip) {
+            Begin-Stage 4; Find-SuspiciousNames -Paths $Path; End-Stage 4 "Filename substring search"
+        } else {
+            Stage-Skipped 4 "Filename substring search"
+        }
+        if (-not $script:Stage5Skip) {
+            Begin-Stage 5; Invoke-UserPathScan -Paths $Path; End-Stage 5 "Recursive content scan"
+        } else {
+            Stage-Skipped 5 "Recursive content scan"
+        }
     }
 
     Write-FullSummary

@@ -13,7 +13,7 @@
 
 *Read-only. No network. One Bash script for Linux. One PowerShell script for Windows.*
 
-`v2.0.0`  ·  `bash 4+`  ·  `PowerShell 5.1+`  ·  `pentest · red team · CTF · privilege escalation`
+`v2.1.0`  ·  `bash 4+`  ·  `PowerShell 5.1+`  ·  `pentest · red team · CTF · privilege escalation`
 
 </div>
 
@@ -24,46 +24,71 @@
 ```
   +-------------------------------------------------------------+
   |  credshunter  *  reusable-credential discovery               |
-  |  v2.0.0  *  authorized testing only * read-only              |
+  |  v2.1.0  *  authorized testing only * read-only              |
   +-------------------------------------------------------------+
 
 [*] Size cap: skipping files larger than 5 MB
-[*] Stage 1 - OS-level credential locations
-[+] Stage 1 complete.
 
-=== Stage 2 - Confirmed credential containers ===
-[+] Found 2 confirmed credential container(s).
+======================================================================
+  Stage 1 -- OS-level credential checks
+----------------------------------------------------------------------
+  Found: 4 file(s)   (0.34s)
 
-=== Stage 5 - File-content scan ===
-[+] Candidate files: 184  (mode: extensions)
-[+] Scanned 184 files.
+  [KEY     ]  /home/alice/.ssh/id_ed25519
+  [HIGH    ]  /home/alice/.bash_history:42
+  [HIGH    ]  /etc/shadow:1
+  [HIGH    ]  /var/spool/cron/crontabs/root:3
+======================================================================
 
-=== Findings ===
+======================================================================
+  Stage 2 -- Confirmed credential containers
+----------------------------------------------------------------------
+  Found: 2 file(s)   (0.05s)
 
-> Confirmed credential containers
-  [CRITICAL] kdbx      /home/alice/Documents/personal.kdbx
-  [CRITICAL] ppk       /opt/scripts/jump-admin.ppk
+  [CRITICAL]  /home/alice/Documents/personal.kdbx
+  [CRITICAL]  /opt/scripts/jump-admin.ppk
+======================================================================
 
-> Reusable credentials
-  [HIGH] content/sshpass_cmd    /home/alice/.bash_history:42
-       sshpass -p 'WinSrvP@ss!' ssh admin@10.0.0.50
-  [HIGH] content/gpp_cpassword  /mnt/sysvol/.../Groups.xml:1
-       cpassword="edBSHOwhZLTjt/QS9FeIcJ83mjW..."
-  [HIGH] content/db_password    /var/www/html/wp-config.php:23
-       define('DB_PASSWORD', 'RealCorpSecret123');
+======================================================================
+  Stage 3 -- High-value file types
+----------------------------------------------------------------------
+  Found: 5 file(s)   (0.18s)
 
-> Private keys & authentication material
-  [KEY] openssh_private  /home/alice/.ssh/id_ed25519:1
+  [INTEREST]  /home/alice/private.pem
+  [INTEREST]  /opt/app/.env.production
+  [INTEREST]  /home/admin/.netrc
+  [INTEREST]  /tmp/network.pcap
+  [INTEREST]  /backup/db_2026.sqlite
+======================================================================
+
+======================================================================
+  Stage 4 -- Filename substring search
+----------------------------------------------------------------------
+  Found: 3 file(s)   (0.12s)
+
+  [NAME    ]  /mnt/share/Onboarding/new_hire_passwords.docx
+  [NAME    ]  /home/admin/scripts/db_password_reset.sh
+  [NAME    ]  /opt/app/customer_credentials.yaml
+======================================================================
+
+======================================================================
+  Stage 5 -- Recursive content scan
+----------------------------------------------------------------------
+  Found: 3 file(s)   (4.27s)
+
+  [HIGH    ]  /mnt/sysvol/Policies/.../Groups.xml:1
+  [HIGH    ]  /var/www/html/wp-config.php:23
+  [HIGH    ]  /srv/scripts/backup.sh:7
+======================================================================
 
 === Summary ===
   Category                                     Count
   --------------------------------------------  -----
   Confirmed credential containers !                2
-  Reusable credentials                            14
+  Reusable credentials                             6
   Private keys / auth material                     1
-  Auxiliary credential-related files               6
-  Credential-named files (exact)                   3
-  Suspicious filenames (substring)                 7
+  High-value file types                            5
+  Filename substring matches                       3
   OS locations checked                            87
   Files skipped (size/binary/perm)                 9
 ```
@@ -93,7 +118,10 @@ the optional log file, and never transmits anything over the network.
 
 | | |
 |---|---|
-| **Five-stage pipeline** | OS-level checks → confirmed containers → auxiliary files → filename patterns → recursive content scan |
+| **Five-stage pipeline** | OS-level checks → confirmed containers → high-value file types → filename substrings → recursive content scan |
+| **Live results per stage** | Each stage prints a framed block of findings the moment it finishes — no waiting for the final report |
+| **Per-stage skip flags** | `--no-stage1` through `--no-stage5` (bash) and `-NoStage1`..`-NoStage5` (PowerShell) toggle each stage on/off |
+| **One config block at top** | All Stage 2-5 pattern lists live in one labelled section near the start of each script — edit one place, no other changes required |
 | **70+ regex patterns** | Tuned against linpeas, winPEAS, gitleaks, noseyparker, detect-secrets, Snaffler, and HTB/THM/PG writeups |
 | **Battle-tested FP filter** | Drops template variables, encrypted markers, language refs, sysprep placeholders, trusted-connection strings |
 | **Smart exclusions** | Skips `/proc`, `/sys`, `node_modules`, `WinSxS`, package caches, vendor dirs — none of these ever hide reusable creds |
@@ -126,6 +154,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    |             registry · GPP · unattend · histories · vaults    |
    |             *.kdbx scan-paths are NOT required for stage 1*   |
    |                                                               |
+   |             skip with --no-stage1 / -NoStage1 / --skip-system |
+   |                                                               |
    +---------------------------------------------------------------+
               |
               v   requires -p PATH from here onwards
@@ -134,22 +164,30 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    |   Stage 2   Confirmed credential containers   [CRITICAL]      |
    |             .kdbx .kdb .psafe3 .ppk .pfx .p12 .jks .keytab .. |
    |                                                               |
-   +---------------------------------------------------------------+
-              |
-              v
-   +---------------------------------------------------------------+
-   |                                                               |
-   |   Stage 3   Auxiliary credential-related files  [INTEREST]    |
-   |             .pem .key .gpg .rdp .ovpn .docx .pdf .dmp .hive   |
+   |             skip with --no-stage2 / -NoStage2                 |
    |                                                               |
    +---------------------------------------------------------------+
               |
               v
    +---------------------------------------------------------------+
    |                                                               |
-   |   Stage 4   Filename patterns                                 |
-   |   4a        Exact credential filenames           [CRED_FILE]  |
-   |   4b        Suspicious substring matches         [NAME]       |
+   |   Stage 3   High-value file types               [INTEREST]    |
+   |             SSH/TLS keys, .env*, keytab, krb5cc_*, .sh,       |
+   |             .bash, backups, .sqlite, .log, .pcap, archives    |
+   |             dedups against Stage 2 (no double-emit)           |
+   |                                                               |
+   |             skip with --no-stage3 / -NoStage3                 |
+   |                                                               |
+   +---------------------------------------------------------------+
+              |
+              v
+   +---------------------------------------------------------------+
+   |                                                               |
+   |   Stage 4   Filename substring search           [NAME]        |
+   |             credential · secret · pass · password · passwd    |
+   |             · account · login   (case-insensitive substring)  |
+   |                                                               |
+   |             skip with --no-stage4 / -NoStage4                 |
    |                                                               |
    +---------------------------------------------------------------+
               |
@@ -159,6 +197,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    |   Stage 5   File-content regex scan              [HIGH] [KEY] |
    |             Extension-filtered candidates from -p paths       |
    |             One combined-alternation grep per file            |
+   |                                                               |
+   |             skip with --no-stage5 / -NoStage5                 |
    |                                                               |
    +---------------------------------------------------------------+
 ```
@@ -172,11 +212,38 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `[CRITICAL]` | Confirmed credential container — the extension is proof | `.kdbx`, `.ppk`, `.pfx`, `.keytab` |
 | `[HIGH]` | Reusable plaintext credential, hash dump, or GPP cpassword | `DB_PASSWORD=…`, `sshpass -p …`, `cpassword="…"` |
 | `[KEY]` | Private-key markers or readable SAM/SYSTEM hive | `-----BEGIN OPENSSH PRIVATE KEY-----` |
-| `[INTEREST]` | Auxiliary file worth manual inspection | `.pem`, `.gpg`, `.rdp`, `.docx`, `.dmp`, `.hive` |
-| `[CRED_FILE]` | Exact credential filename match | `.bash_history`, `wp-config.php`, `Groups.xml`, `.env.production` |
-| `[NAME]` | Filename substring match | `*password*`, `*credential*`, `*handover*`, `*vault*` |
+| `[INTEREST]` | High-value file type worth manual inspection | `.pem`, `.env.production`, `.sqlite`, `.pcap` |
+| `[NAME]` | Filename matches a credential-related substring | `*password*`, `*credential*`, `*account*`, `*login*` |
 | `[CHECK]` | OS location inspected (existence + readability noted) | `HKLM:\…\Winlogon`, `/etc/shadow` |
 | `[SKIP]` | File skipped (binary / size / unreadable) | (size>5MB / binary / permission denied) |
+
+---
+
+## User-customizable pattern lists
+
+Open either script and look near the top. You will find a clearly delimited block:
+
+```
+# ============================================================================
+#  USER-CUSTOMIZABLE PATTERN LISTS
+#
+#  Edit the arrays below to add or remove what each stage flags. NO OTHER
+#  changes are required when you tweak these.
+# ============================================================================
+```
+
+Below it sit the six arrays driving Stages 2-5:
+
+| Bash array | PowerShell variable | Purpose |
+|---|---|---|
+| `STAGE2_EXTENSIONS` | `$script:Stage2Extensions` | Confirmed credential containers (Stage 2) |
+| `STAGE3_EXTENSIONS` | `$script:Stage3Extensions` | High-value extensions (Stage 3) |
+| `STAGE3_EXACT_NAMES` | `$script:Stage3ExactNames` | Exact filenames like `krb5.conf`, `.netrc` (Stage 3) |
+| `STAGE3_GLOB_PATTERNS` | `$script:Stage3GlobPatterns` | Globs like `krb5cc_*`, `.env.*` (Stage 3) |
+| `STAGE4_NAME_TOKENS` | `$script:Stage4NameTokens` | Substring tokens (Stage 4) |
+| `STAGE5_EXTENSIONS` | `$script:Stage5Extensions` | Content-scan extension allow-list (Stage 5) |
+
+Add a row to any array, save the script, run it. No other code changes required.
 
 ---
 
@@ -302,6 +369,77 @@ OpenVPN / WireGuard       Program Files\OpenVPN\config\*.ovpn,
 
 </details>
 
+<details><summary><b>Confirmed credential containers (Stage 2 — extension is proof)</b></summary>
+
+```
+.kdbx .kdb           KeePass 2.x / 1.x
+.psafe3              Password Safe v3
+.agilekeychain       1Password legacy bundle
+.opvault             1Password vault
+.1pif .1pux          1Password exports
+.lpdb                LastPass local DB
+.enpass .enpassdb    Enpass
+.bitwarden_export    Bitwarden export
+.ppk                 PuTTY private key
+.pfx .p12            PKCS#12 (cert + private key)
+.pvk                 Microsoft private key file
+.jks .keystore .truststore   Java keystores
+.bek .fve            BitLocker recovery / FVE
+.keytab              Kerberos keytab
+.dpapimk             Windows DPAPI master key
+```
+
+</details>
+
+<details><summary><b>High-value file types (Stage 3 — strong signal, recurated)</b></summary>
+
+Stage 3 looks for three kinds of patterns:
+
+```
+Extensions
+  SSH / TLS private keys     .pem .key .priv .crt .cer .csr
+  App-secret env files       .env .envrc
+  Kerberos                   .keytab            (also in Stage 2; deduped)
+  Shell scripts              .sh .bash
+  Backup / scratch variants  .bak .old .orig .backup .swp .save
+  SQLite databases           .db .sqlite .sqlite3
+  Logs                       .log
+  Packet captures            .pcap .pcapng
+  Compressed archives        .tar .tgz .gz .zip .7z
+
+Exact filenames
+  krb5.conf
+  .htpasswd  .netrc  .pgpass
+  .my.cnf  my.cnf  .mysql.cnf
+
+Glob patterns
+  krb5cc_*                   Kerberos credential caches
+  *.tar.gz                   Compound-extension tarballs
+  .env.*                     .env.production / .env.local / .env.development / etc.
+```
+
+A file matching any of these is emitted as `[INTEREST]`, unless it was already emitted as `[CRITICAL]` by Stage 2 (the runtime dedup prevents `*.keytab` from being double-flagged).
+
+</details>
+
+<details><summary><b>Suspicious filenames (Stage 4 — substring search)</b></summary>
+
+Stage 4 is intentionally tight. The 7 substring tokens are:
+
+```
+credential   secret   pass   password   passwd   account   login
+```
+
+Any filename containing one of these (case-insensitive substring) is emitted as `[NAME]`. Binary executables, libraries, debug symbols, and credshunter's own script are excluded:
+
+```
+.dll .exe .sys .so .dylib .ocx .pdb .nupkg .mui .cpl .drv (+ self-script)
+```
+
+If you need to detect well-known credential files like `id_rsa`, `shadow`, or `unattend.xml` at non-standard paths, add their identifying substring (e.g. `rsa`, `shadow`, `unattend`) to `STAGE4_NAME_TOKENS` at the top of the script.
+
+</details>
+
 <details><summary><b>Pattern coverage (Stage 5 — content regex)</b></summary>
 
 ```
@@ -382,64 +520,6 @@ Private-key markers ([KEY] tier)
 
 </details>
 
-<details><summary><b>Suspicious filenames (Stage 4)</b></summary>
-
-```
-Direct credential terms (substring)
-  password   passwd   pwd   passphrase   passcode
-  credential   creds   vault   secret
-  htpasswd   netrc   pgpass
-  db_pass   database_password   dbpass
-  masterkey   master_password   masterpass   sshpass
-  pwdump   kerberoast   asreproast   hashdump   mimikatz   lsass
-  keepass   sshkey   sshconfig
-  winscp   putty   filezilla   mremoteng   rdcman
-  ansible_vault   vault_pass   smbpasswd   autologon
-  unattend   sysprep   autounattend   wp_config   wp-config
-
-Real-engagement vocabulary (substring)
-  handover   onboarding   offboarding   newhire   helpdesk   runbook
-  as-built   build sheet   it_master   reset_password   password_recovery
-  domain_admin   service_account   svc_account   svcaccount   svcacct
-  domain_join   local_admin   break_glass   default_password
-  snmp_community
-
-Exact filename matches
-  .bash_history  .zsh_history  .sh_history  .mysql_history  .psql_history
-  .python_history  .node_repl_history  .irb_history  .rediscli_history
-  .lesshst  .viminfo  .wget-hsts
-  .netrc  .pgpass  .my.cnf  my.cnf  .mysql.cnf  .dbshell  .mongorc.js
-  .pypirc  .npmrc  .gitconfig  .git-credentials  .gitcredentials
-  .htpasswd  .htaccess  shadow  gshadow  passwd  sudoers  master.passwd
-  login.defs  auth.log  secure  pam.conf  smb.conf  smbpasswd  freerdp
-  id_rsa  id_dsa  id_ecdsa  id_ed25519  id_xmss
-  authorized_keys  authorized_keys2  known_hosts  ssh_config  sshd_config
-  SAM  SYSTEM  SECURITY  SOFTWARE  NTUSER.DAT  NTDS.dit
-  unattend.xml  unattended.xml  autounattend.xml  sysprep.xml  sysprep.inf
-  Groups.xml  Services.xml  Scheduledtasks.xml  DataSources.xml
-  Printers.xml  Drives.xml
-  web.config  wp-config.php  wp-config.bak  wp-config.old
-  configuration.php  settings.php  local.xml  config.inc.php  config.php
-  appsettings.json  appsettings.Production.json  appsettings.Development.json
-  machine.config  hibernate.cfg.xml  persistence.xml  context.xml
-  tomcat-users.xml  standalone.xml  server.xml  application.properties
-  application.yml  bootstrap.yml
-  pg_hba.conf  postgresql.conf  my.ini  mongod.conf  redis.conf
-  elasticsearch.yml  kibana.yml  tnsnames.ora  sqlnet.ora  listener.ora
-  wallet.dat
-  winscp.ini  putty.reg  sitemanager.xml  recentservers.xml  filezilla.xml
-  confCons.xml  mRemoteNG.xml  default.rdg  RDCMan.settings
-  .env  .env.local  .env.dev  .env.production  .env.staging  .env.bak
-  .vault_pass  vault_pass.txt  .ansible_vault
-  tomcat-users.xml  credentials.xml  master.key  secret.key
-  hudson.util.Secret  SiteList.xml  applicationHost.config
-  KeePass.config.xml  grafana.ini  gitlab.rb  app.ini  accounts.xml
-  secrets.tdb  user-data.txt  cloud-config  ks.cfg  initial-setup-ks.cfg
-  preseed.cfg  opasswd  sssd.conf
-```
-
-</details>
-
 <details><summary><b>File extensions scanned (Stage 5 content)</b></summary>
 
 ```
@@ -480,51 +560,6 @@ Variant suffixes
 
 </details>
 
-<details><summary><b>Confirmed credential containers (Stage 2 — extension is proof)</b></summary>
-
-```
-.kdbx .kdb           KeePass 2.x / 1.x
-.psafe3              Password Safe v3
-.agilekeychain       1Password legacy bundle
-.opvault             1Password vault
-.1pif .1pux          1Password exports
-.lpdb                LastPass local DB
-.enpass .enpassdb    Enpass
-.bitwarden_export    Bitwarden export
-.ppk                 PuTTY private key
-.pfx .p12            PKCS#12 (cert + private key)
-.pvk                 Microsoft private key file
-.jks .keystore .truststore   Java keystores
-.bek .fve            BitLocker recovery / FVE
-.keytab              Kerberos keytab
-.dpapimk             Windows DPAPI master key
-```
-
-</details>
-
-<details><summary><b>Auxiliary credential-related files (Stage 3 — strong signal, ambiguous)</b></summary>
-
-```
-.pem .key .priv      PEM-encoded data (key OR cert)
-.asc .gpg            PGP material
-.wallet              Oracle wallet
-.rdp .ovpn           saved sessions / VPN profiles
-.rdg .rdcman .rtsz .rtsg .remmina .pcf .tblk   session managers
-.vmx                 VMware Workstation (encoded.password / displayName.passwd)
-.pst .ost            Outlook archives (admin-pw emails)
-.doc .docx .docm .dot .dotx .dotm
-.xls .xlsx .xlsm .xlsb .xlt .xltx .xltm
-.ppt .pptx .pptm .pps .ppsx
-.odt .ods .odp .odg
-.pdf
-.one .onetoc2        OneNote
-.mdb .accdb .bacpac .dacpac .mdf .ldf .frm .myd
-.sqlite .sqlite3 .db .db3
-.hive .hiv .dmp .mdmp .crash .core   registry hives & memory dumps
-```
-
-</details>
-
 ---
 
 ## Detection examples
@@ -553,11 +588,10 @@ Variant suffixes
 [KEY] openssh_private          /home/alice/.ssh/id_ed25519:1
        -----BEGIN OPENSSH PRIVATE KEY-----
 
-[INTEREST] credential_related  /home/alice/Documents/jumpbox.rdp
+[INTEREST] high_value_file     /home/alice/private.pem
+[INTEREST] high_value_file     /opt/app/.env.production
 
-[CRED_FILE] /opt/jenkins/credentials.xml
-
-[NAME] /mnt/it_share/Onboarding/new_hire_passwords.docx
+[NAME]                         /mnt/it_share/Onboarding/new_hire_passwords.docx
 ```
 
 ---
@@ -571,8 +605,13 @@ Variant suffixes
 | `-a` / `--all` | `-All` | Stage 5 scans every readable text file |
 | `-m N` | `-MaxFileSizeMB N` | Skip files larger than N MB. Default 5 |
 | `--no-size-limit` | `-NoSizeLimit` | Disable the size cap entirely |
-| `-s` / `--skip-system` | `-SkipSystem` | Skip Stage 1 (OS-level checks) |
-| `-q` / `--quiet` | `-Quiet` | Reduce status noise, findings still printed |
+| `-s` / `--skip-system` | `-SkipSystem` | Skip Stage 1 (legacy alias for `--no-stage1`) |
+| `--no-stage1` | `-NoStage1` | Skip Stage 1 (OS-level credential checks) |
+| `--no-stage2` | `-NoStage2` | Skip Stage 2 (confirmed credential containers) |
+| `--no-stage3` | `-NoStage3` | Skip Stage 3 (high-value file types) |
+| `--no-stage4` | `-NoStage4` | Skip Stage 4 (filename substring search) |
+| `--no-stage5` | `-NoStage5` | Skip Stage 5 (recursive content scan) |
+| `-q` / `--quiet` | `-Quiet` | Suppress per-finding lines inside framed stage blocks |
 | `--no-color` | `-NoColor` | Strip ANSI escape codes |
 | `-o FILE` | `-OutputFile FILE` | Append plain-text log of all findings |
 | `-h` / `--help` | `Get-Help .\credshunter.ps1` | Full help |
@@ -595,6 +634,12 @@ sudo ./credshunter.sh -p / -m 10 -o /tmp/findings.txt
 # CTF / lab — content scan only, quiet
 ./credshunter.sh --skip-system -p . -q
 
+# OS checks + confirmed containers only — fast triage pass
+./credshunter.sh -p / --no-stage3 --no-stage4 --no-stage5
+
+# Skip the long content scan, keep everything else
+./credshunter.sh -p / --no-stage5
+
 # Pipe-safe (no color)
 ./credshunter.sh -p /etc --no-color | grep '\[HIGH\]'
 ```
@@ -610,9 +655,43 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 # All files in a backup tree, with exclusion
 .\credshunter.ps1 -All -Path D:\Backup -ExcludePath D:\Backup\ToolInstallers
 
+# Triage mode — Stage 1 + Stage 2 only
+.\credshunter.ps1 -Path C:\ -NoStage3 -NoStage4 -NoStage5
+
+# Skip the slow Stage 5 content scan
+.\credshunter.ps1 -Path C:\ -NoStage5
+
 # Through evil-winrm pipe (no color, log to public dir)
 .\credshunter.ps1 -Path C:\Users -NoColor -OutputFile C:\Users\Public\loot.txt
 ```
+
+---
+
+## Live results
+
+Every stage prints a framed block to stdout the moment it finishes, before the
+next stage starts. You see findings as they are discovered, not at the end of
+the run:
+
+```
+======================================================================
+  Stage 2 -- Confirmed credential containers
+----------------------------------------------------------------------
+  Found: 2 file(s)   (0.05s)
+
+  [CRITICAL]  /home/alice/Documents/personal.kdbx
+  [CRITICAL]  /opt/scripts/jump-admin.ppk
+======================================================================
+```
+
+Behaviour:
+
+- **Stage-scoped.** Each block lists only findings from *that* stage. The final consolidated report at end-of-run is unchanged.
+- **All findings printed**, no truncation.
+- **Timing in the header.** `(0.05s)` is the wall time of that stage.
+- **Empty stages still emit a block** with `Found: 0 file(s)` — confirms the stage ran.
+- **Skipped stages emit `Stage N -- ... [SKIPPED]`** with no body.
+- **Quiet mode** (`-q` / `-Quiet`) suppresses the per-finding lines but keeps the headers, timings, and counts.
 
 ---
 
@@ -658,6 +737,14 @@ Plus default path pruning of `.git`, `node_modules`, `.venv`, `__pycache__`,
 `/var/lib/docker/overlay2`, `WindowsApps`, `Packages`, and more — none of
 these locations ever hide reusable creds in a real engagement.
 
+Plus stage-level hardcoded suppressions for real-world host noise:
+SQL Server install paths, MSSQL system database files (`master.mdf`,
+`model.mdf`, `msdb.mdf`, `tempdb.mdf`), per-user browser-cache trees
+(Edge / Chrome `Cache`, `Code Cache`, `GPUCache`, `ShaderCache`),
+SQL `@password` parameter references in stored procedures, Microsoft's
+published Yukon90_ SQL Agent signing-cert password, masked passwords
+(`'*******'`), and SQLTelemetry / SafeSqlCommand log lines.
+
 ---
 
 ## Performance
@@ -676,6 +763,8 @@ these locations ever hide reusable creds in a real engagement.
   membership — O(1) instead of `Array -contains`.
 - **Per-path dedup** across all stages: if Stage 1 reads `/etc/shadow`,
   Stage 5 silently skips it.
+- **Stage 2 ↔ Stage 3 dedup**: a `*.keytab` flagged as `[CRITICAL]` in Stage 2
+  is not re-emitted as `[INTEREST]` in Stage 3.
 - **Self-skip:** the tool resolves `$BASH_SOURCE` / `$PSCommandPath` and
   refuses to grep its own source.
 
