@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="384" viewBox="0 0 1280 384" fill="none" role="img" aria-label="credshunter — reusable-credential discovery">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="384" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#11161D"/>
+      <stop offset="1" stop-color="#0A0D12"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#3FB950"/>
+    </linearGradient>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="1278" height="382" rx="22" fill="url(#bg)" stroke="#FFFFFF" stroke-opacity="0.07"/>
+  <rect x="1" y="1" width="1278" height="4" rx="2" fill="url(#accent)" opacity="0.9"/>
+
+  <!-- terminal dots -->
+  <circle cx="52" cy="52" r="7" fill="#FF5F56"/>
+  <circle cx="78" cy="52" r="7" fill="#FFBD2E"/>
+  <circle cx="104" cy="52" r="7" fill="#27C93F"/>
+
+  <!-- faint key watermark -->
+  <g opacity="0.06" fill="none" stroke="url(#accent)" stroke-width="20" stroke-linecap="round" transform="translate(958 112)">
+    <circle cx="64" cy="84" r="54"/>
+    <line x1="118" y1="84" x2="280" y2="84"/>
+    <line x1="240" y1="84" x2="240" y2="132"/>
+    <line x1="272" y1="84" x2="272" y2="120"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="50" y="214" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="104" font-weight="700" letter-spacing="-2">
+    <tspan fill="#2DD4BF">$</tspan><tspan dx="24" fill="#E6EDF3">creds</tspan><tspan fill="url(#accent)">hunter</tspan>
+  </text>
+
+  <!-- tagline -->
+  <text x="56" y="268" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="28" fill="#9BA6B2">Reusable-credential discovery for authorized post-exploitation</text>
+
+  <!-- meta -->
+  <text x="56" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" fill="#6E7886" letter-spacing="2">read-only · no network · Linux + Windows</text>
+</svg>

@@ -27,7 +27,7 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.0.0"
+VERSION="2.2.0"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).
@@ -55,6 +55,16 @@ USER_EXCLUDE_PATHS=()
 OUTPUT_FILE=""
 MAX_MATCHES_PER_FILE=20
 MAX_PREVIEW_LEN=140
+# Longest line classify_line will inspect. Real credential lines are short; a
+# multi-KB minified/base64/log line would otherwise pin the per-pattern regex
+# loop. 16 KB comfortably covers single-line GPP Groups.xml / one-line JSON
+# connection strings while bounding worst-case CPU. Mirrored in the PS engine.
+MAX_LINE_LEN=16384
+# Upper bound on regex-matching lines fed to classify_line per file. The real
+# finding cap is MAX_MATCHES_PER_FILE (post-FP); this only bounds pathological
+# files where thousands of lines match the prefilter but are all false
+# positives, so a genuine credential after them is still reached and reported.
+PREFILTER_LINE_CAP=5000
 
 # Stage-1 live-output state. When IN_STAGE1=1, the record_* helpers stream
 # each finding to stderr as it's discovered so the operator sees results in
@@ -70,14 +80,12 @@ TMPDIR="$(mktemp -d -t credshunter.XXXXXX 2>/dev/null || mktemp -d /tmp/credshun
 HIGH_FILE="$TMPDIR/high.tsv"
 KEY_FILE="$TMPDIR/keys.tsv"
 NAME_FILE="$TMPDIR/names.tsv"
-EXACT_FILE="$TMPDIR/exact.tsv"
 INTEREST_FILE="$TMPDIR/interest.tsv"
 GUARANTEED_FILE="$TMPDIR/guaranteed.tsv"
 SKIPPED_FILE="$TMPDIR/skipped.tsv"
 CHECKED_FILE="$TMPDIR/checked.tsv"
 CANDIDATE_FILES="$TMPDIR/candidates.lst"
-FIND_EXCLUDES_CACHE=""
-touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" "$EXACT_FILE" \
+touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" \
       "$INTEREST_FILE" "$GUARANTEED_FILE" "$SKIPPED_FILE" \
       "$CHECKED_FILE" "$CANDIDATE_FILES"
 
@@ -125,21 +133,26 @@ section() { printf '\n%b═══ %s ═══%b\n' "${BOLD}${C}" "$*" "$NC" >&2
 
 # Stream a single Stage-1 finding to stderr as it is recorded.
 #   Args: TIER LABEL PATH [LINE]
-# TIER ∈ {CRITICAL HIGH KEY INTEREST CRED_FILE NAME}. Increments
+# TIER ∈ {CRITICAL HIGH KEY INTEREST NAME}. Increments
 # SUBSTAGE_FINDINGS so the wrapper knows the substage produced output.
 stage1_emit() {
     [ "$QUIET" -eq 1 ] && return
-    local tier="$1" label="$2" path="$3" line="${4:-0}"
+    local tier="$1" label="$2" path="$3" line="${4:-0}" preview="${5:-}"
     local color="$R"
     case "$tier" in
         CRITICAL|HIGH)            color="$R" ;;
         KEY)                      color="$M" ;;
-        INTEREST|CRED_FILE|NAME)  color="$Y" ;;
+        INTEREST|NAME)            color="$Y" ;;
     esac
     if [ "${line:-0}" -gt 0 ] 2>/dev/null; then
         printf '%b   └─ [%s]%b %s → %s:%s\n' "$color" "$tier" "$NC" "$label" "$path" "$line" >&2
     else
         printf '%b   └─ [%s]%b %s → %s\n' "$color" "$tier" "$NC" "$label" "$path" >&2
+    fi
+    # Show the matched content/command inline (dim) so the operator can verify
+    # an embedded credential live, even when the value lives in the preview.
+    if [ -n "$preview" ] && [ "$preview" != "$path" ]; then
+        printf '%b        %s%b\n' "$D" "$preview" >&2
     fi
     SUBSTAGE_FINDINGS=$((SUBSTAGE_FINDINGS + 1))
 }
@@ -215,8 +228,8 @@ Examples:
   ./credshunter.sh -p / -x /var/lib/customer-app
 
 Exit codes:
-  0 = nothing sensitive found
-  1 = at least one critical/high/key/exact-name finding
+  0 = nothing sensitive found (INTEREST / NAME alone do not change the code)
+  1 = at least one CRITICAL / HIGH / KEY finding
   2 = argument / I/O error
   130 = interrupted (Ctrl+C / SIGTERM)
 EOF
@@ -302,11 +315,11 @@ STAGE5_EXTENSIONS=(
     sh bash zsh ksh csh fish profile bashrc zshrc
     ps1 psm1 psd1 ps1xml bat cmd vbs vbe wsf wsh ahk
     # Source code commonly carrying hardcoded passwords
-    py pl rb php phtml php3 php5 lua groovy tcl coffee
+    py pl rb php phtml php3 php5 inc lua groovy tcl coffee
     java cs vb go rs c cpp h hpp
     js ts jsx tsx mjs cjs
     # Web app files
-    aspx asp ashx asmx asax ascx cshtml vbhtml
+    aspx asp ashx asmx asax ascx cshtml vbhtml master svc
     jsp jspx jspf cfm cfc htm html htaccess
     # Database / connection (text)
     sql ddl dump dsn udl ora tns
@@ -324,20 +337,48 @@ STAGE5_EXTENSIONS=(
     service unit timer socket crontab cron
     # Variant config suffixes
     local shared template example sample dist
+    # ── Secret-bearing / auth file extensions ────────────────────────────
+    secret secrets creds cred passwd auth vault
+    # ── Config management / IaC / templating (Ansible/Puppet/Salt/Chef) ───
+    j2 erb pp sls tmpl tpl gotmpl nix dhall jsonnet libsonnet cson bicep
+    # ── Additional source languages ──────────────────────────────────────
+    pyw kt kts scala sbt gradle clj cljs cljc edn ex exs erl hrl dart swift
+    vue svelte astro cc cxx hxx hh cgi fcgi php4 php7 phps pht
+    # ── .NET / Visual Studio project & publish files (conn strings, deploy) ─
+    csproj vbproj fsproj vcxproj sln resx resw pubxml publishsettings manifest
+    # ── Windows scripting / app / shortcut formats ───────────────────────
+    hta au3 url psc1 pssc desktop
+    # ── VPN / network configuration ──────────────────────────────────────
+    nmconnection network netdev link wg pcf mobileconfig
+    # ── Database scripts / ORM schemas ───────────────────────────────────
+    psql pgsql plsql tsql cql sqlproj prisma
+    # ── Notes / documentation / mail ─────────────────────────────────────
+    org rst adoc asciidoc note notes wiki eml
+    # ── Backup / package-manager config remnants (old configs keep creds) ─
+    dpkg-old dpkg-dist dpkg-new rpmsave rpmnew rpmorig ucf-old ucf-dist
+    bk bkp bkup sav swp swo default
+    # ── systemd unit types ───────────────────────────────────────────────
+    path mount automount target slice scope
+    # ── Tabular / structured data exports ────────────────────────────────
+    tab psv jsonl ndjson
 )
 
 # ----------------------------------------------------------------------------
 #  Argument parsing
 # ----------------------------------------------------------------------------
 parse_args() {
+    # Guard: option requires a following argument. Without this, a trailing
+    # `-p`/`-x`/`-m`/`-o` would hit `$2` under `set -u` and abort with an ugly
+    # "unbound variable" instead of a clean, actionable error.
+    _need_arg() { [ "$1" -ge 2 ] || { err "Option '$2' requires an argument."; usage; exit 2; }; }
     while [ $# -gt 0 ]; do
         case "$1" in
-            -p|--path)        SCAN_PATHS+=("$2"); shift 2 ;;
-            -x|--exclude)     USER_EXCLUDE_PATHS+=("$2"); shift 2 ;;
+            -p|--path)        _need_arg "$#" "$1"; SCAN_PATHS+=("$2"); shift 2 ;;
+            -x|--exclude)     _need_arg "$#" "$1"; USER_EXCLUDE_PATHS+=("$2"); shift 2 ;;
             -a|--all)         ALL_MODE=1; shift ;;
-            -m|--max-size)    MAX_FILE_SIZE_MB="$2"; SKIP_LARGE=1; shift 2 ;;
+            -m|--max-size)    _need_arg "$#" "$1"; MAX_FILE_SIZE_MB="$2"; SKIP_LARGE=1; shift 2 ;;
             --no-size-limit)  SKIP_LARGE=0; shift ;;
-            -o|--output)      OUTPUT_FILE="$2"; shift 2 ;;
+            -o|--output)      _need_arg "$#" "$1"; OUTPUT_FILE="$2"; shift 2 ;;
             -s|--skip-system) SKIP_SYSTEM=1; STAGE1_SKIP=1; shift ;;
             --no-stage1)      STAGE1_SKIP=1; SKIP_SYSTEM=1; shift ;;
             --no-stage2)      STAGE2_SKIP=1; shift ;;
@@ -355,9 +396,16 @@ parse_args() {
     done
 
     if [ -n "$OUTPUT_FILE" ]; then
-        : >"$OUTPUT_FILE" || { err "Cannot write to $OUTPUT_FILE"; exit 2; }
+        # The log holds extracted plaintext credential previews, so create it
+        # owner-only (umask 077) and tighten any pre-existing loose mode — never
+        # leave harvested secrets world/group readable in a shared directory.
+        ( umask 077; : >"$OUTPUT_FILE" ) || { err "Cannot write to $OUTPUT_FILE"; exit 2; }
+        chmod 600 "$OUTPUT_FILE" 2>/dev/null || true
     fi
+    # Must be a positive integer (>= 1). `-m 0` would make `find -size -0c`
+    # and the Stage-1 size gate exclude every file, silently scanning nothing.
     [[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]] || { err "max-size must be a number"; exit 2; }
+    [ "$MAX_FILE_SIZE_MB" -ge 1 ] || { err "max-size must be >= 1 (got '$MAX_FILE_SIZE_MB')"; exit 2; }
 
     # Normalise user exclusions WITHOUT canonicalising — `find` emits paths
     # using whatever prefix the start directory had (e.g. /tmp not /private/tmp
@@ -395,10 +443,15 @@ parse_args() {
 
 CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
-    'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase)[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
 
     # ── DB / service-prefixed passwords ──────────────────────────────────
-    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
+    # keystone_password, nova_password, app_password, mail_pass, ...). The
+    # value FP filter removes references/placeholders. Placed AFTER db_password
+    # so the well-known prefixes keep their specific label.
+    'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
 
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
@@ -427,28 +480,43 @@ CRED_PATTERNS=(
     # (Massively expanded from research: HTB Resolute PowerShell transcripts,
     #  Snaffler classifiers, linpeas pwd_inside_history detector.)
     'sshpass_cmd|sshpass[[:space:]]+(-p|--password)[[:space:]]*['"'"'"]?[^[:space:]'"'"'"]{2,}'
-    'mysql_cmd|(mysql|mysqladmin|mysqldump|mysqlimport)[[:space:]].*[[:space:]]-p[^[:space:]"#-][^[:space:]"#]{2,}'
+    'mysql_cmd|(mysql|mysqladmin|mysqldump|mysqlimport)[[:space:]].*(--password=[^[:space:]"#]{2,}|[[:space:]]-p[^[:space:]"#-][^[:space:]"#]{2,})'
     'psql_cmd|psql[[:space:]].*(-W|--password=|host=[^[:space:]]+.*password=)[^[:space:]"#]{2,}'
     'mongo_cmd|(mongo|mongosh|mongodump|mongorestore)[[:space:]].*(-p|--password)[[:space:]=]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'redis_cmd|redis-cli[[:space:]].*(-a|--pass)[[:space:]=]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'curl_basic|(curl|wget)[[:space:]].*--?(u|user|http-user)[[:space:]=]+[^:[:space:]]+:[^[:space:]'"'"'"]{3,}'
     'wget_pass|wget[[:space:]].*--(http-password|password|ftp-password)[[:space:]=]+[^[:space:]"]{3,}'
     'smbclient_pass|smbclient[[:space:]].*-U[[:space:]]+[^%[:space:]]+%[^[:space:]]{3,}'
-    'smbmount_pass|mount[[:space:]]+(-t[[:space:]]+cifs|//).*-o[[:space:]].*(pass|password)=[^,[:space:]"]{3,}'
-    'freerdp_pass|(xfreerdp|freerdp|rdesktop)[[:space:]].*(-p|/p:)[[:space:]]?['"'"'"]?[^[:space:]"]{2,}'
+    'smbmount_pass|(mount(\.cifs)?[[:space:]]+(-t[[:space:]]+cifs|//)|mount\.cifs[[:space:]]+//).*(pass|password)=[^,[:space:]"]{3,}'
+    'lftp_pass|lftp[[:space:]].*(-u[[:space:]]+[^,[:space:]]+,[^[:space:]]{2,}|-p[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,})'
+    'keepalived_authpass|^[[:space:]]*auth_pass[[:space:]]+[^[:space:]#]{2,}'
+    'reg_autologon|reg(\.exe)?[[:space:]]+add.*(Default|AltDefault)Password.*/d[[:space:]]+['"'"'"]?[^[:space:]'"'"'"/]{2,}'
+    'freerdp_pass|(xfreerdp|freerdp|rdesktop|mstsc)[[:space:]].*(-p|/p:)[[:space:]]?['"'"'"]?[^[:space:]"]{2,}'
     'plink_pass|plink[[:space:]].*-pw[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
+    # Generic password flag in ANY command line (not coupled to a tool name):
+    # catches `&('"'"'…plink.exe'"'"') -pw '"'"'SECRET'"'"'`, `--password=X`, `/p:X`
+    # which the tool-anchored patterns above miss.
+    'cmdline_pw_flag|(^|[[:space:]])((-pw|--pw|-pass|--password)[[:space:]=]+['"'"'"]?[^[:space:]'"'"'"]{3,}|(/p:|/pass:|/password:)['"'"'"]?[^[:space:]'"'"'"]{3,})'
     'net_use_pass|net[[:space:]]+use[[:space:]]+.*[[:space:]]/user:[^[:space:]]+[[:space:]]+[^[:space:]/"]{3,}'
     # `net user john.doe "MySecurePassword" /domain` — local/domain user creation
-    'net_user_create|net[[:space:]]+user[[:space:]]+[^[:space:]]+[[:space:]]+["'"'"']?[^[:space:]"'"'"']{3,}["'"'"']?[[:space:]]+(/add|/domain|/passwordreq|/active|/expires)'
+    # `net user <user> <password> [/add|/domain|...]` — the trailing flag is
+    # OPTIONAL so a plain `net user john MyPass` set-password is also caught.
+    # The 2nd/3rd tokens must NOT start with `/` (a flag), which prevents
+    # matching the 2-token display form `net user john`.
+    'net_user_create|net[[:space:]]+user[[:space:]]+[^[:space:]/]+[[:space:]]+["'"'"']?[^[:space:]/"'"'"']{3,}'
     # Linux user creation / password setting in scripts (HTB / OSCP staples)
-    'useradd_pass|useradd[[:space:]].*-p[[:space:]]+["'"'"']?[^[:space:]"'"'"']{3,}'
+    'useradd_pass|(useradd|usermod)[[:space:]].*-p[[:space:]]+["'"'"']?[^[:space:]"'"'"']{3,}'
     'chpasswd_inline|(echo|printf)[[:space:]]+["'"'"']?[^:[:space:]]+:[^[:space:]"'"'"']{3,}["'"'"']?[[:space:]]*\|[[:space:]]*chpasswd'
     'chpasswd_heredoc|chpasswd[[:space:]]*<<<?[[:space:]]*["'"'"']?[^:[:space:]]+:[^[:space:]"'"'"']{3,}'
     'passwd_stdin|(echo|printf)[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"'][[:space:]]*\|[[:space:]]*passwd[[:space:]]+[^[:space:]]+([[:space:]]+--stdin)?'
     # PowerShell local user / AD password cmdlets
     'ps_localuser|(New-LocalUser|Add-LocalUser|Set-LocalUser)[[:space:]].*-(Password|AccountPassword)[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"']'
     'ps_adsetpass|(Set-ADAccountPassword|New-ADUser)[[:space:]].*-(AccountPassword|NewPassword)[[:space:]]'
-    'ps_secstring_inline|ConvertTo-SecureString[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"'][[:space:]]+-AsPlainText[[:space:]]+-Force'
+    # Robust: handles positional or -String, and -Force is optional.
+    'ps_secstring_plain|ConvertTo-SecureString[[:space:]]+(-String[[:space:]]+)?["'"'"'][^"'"'"']{3,}["'"'"'][[:space:]]+(-Key[[:space:]]+\S+[[:space:]]+)?-AsPlainText'
+    # Plaintext password passed to a cmdlet -Password/-AccountPassword param
+    # as a quoted literal (secure-string objects use $vars -> not matched).
+    'ps_password_param|-(Password|Pass|AccountPassword|AdminPassword|NewPassword|DefaultPassword)[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"']'
     'ldap_pass|(ldapsearch|ldapadd|ldapmodify|ldapdelete|ldapcompare)[[:space:]].*-w[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'kinit_pass|kinit[[:space:]].*<[[:space:]]*[^[:space:]]+'
     'rsync_pass|rsync[[:space:]].*--password-file=[^[:space:]]+'
@@ -467,19 +535,32 @@ CRED_PATTERNS=(
     'schtasks_pass|schtasks[[:space:]].*/rp[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'evilwinrm_cmd|evil-winrm[[:space:]].*-p[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'impacket_cred|(impacket-\S+|psexec\.py|wmiexec\.py|smbexec\.py|secretsdump\.py|GetUserSPNs\.py|GetNPUsers\.py)[[:space:]].*[^[:space:]/]+/[^:[:space:]]+:[^@[:space:]]{3,}@'
-    'expect_send|send[[:space:]]+['"'"'"][^"'"'"']+['"'"'"]'
 
     # ── Web framework specifics ──────────────────────────────────────────
     'wp_db_password|define\([[:space:]]*['"'"'"]DB_PASSWORD['"'"'"][[:space:]]*,[[:space:]]*['"'"'"][^'"'"'"]{2,}'
     'joomla_password|public[[:space:]]+\$(password|smtppass|dbpass|secret)[[:space:]]*=[[:space:]]*['"'"'"][^'"'"'"]{2,}'
     'drupal_password|['"'"'"]password['"'"'"][[:space:]]*=>[[:space:]]*['"'"'"][^'"'"'"]{4,}'
+    # Generic PHP define() for any *PASSWORD/*PASS/*PWD/*SECRET constant
+    # (DB_PASS, SMTP_PASSWORD, SECRET_KEY, ...). CTF staple beyond DB_PASSWORD.
+    'define_secret|define[[:space:]]*\([[:space:]]*['"'"'"][A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|PASS|SECRET)['"'"'"][[:space:]]*,[[:space:]]*['"'"'"][^'"'"'"]{3,}'
+    # Hardcoded password as the 3rd positional arg of a DB-connect call --
+    # new mysqli("host","user","PASS"), mysqli_connect(...), new PDO(...),
+    # mysql_connect(...), pg_connect(...). Classic HTB/CTF pattern (e.g. Magic:
+    # new mysqli("localhost","theseus","iamkingofcrete2398","Magic")).
+    'php_db_connect|(mysqli_connect|mysql_connect|pg_connect|new[[:space:]]+mysqli|new[[:space:]]+PDO|->[[:space:]]*connect)[[:space:]]*\(([^,]*,){2}[[:space:]]*['"'"'"][^'"'"'"]{3,}['"'"'"]'
 
     # ── Linux auth files ─────────────────────────────────────────────────
     'htpasswd_hash|^[^:[:space:]#]+:\$(apr1|2[aby]?|5|6|y)\$'
-    'htpasswd_md5|^[^:[:space:]#]+:[A-Za-z0-9./]{13}$'
     'netrc_password|^[[:space:]]*(machine[[:space:]]+\S+[[:space:]]+)?(login|user|username)[[:space:]]+\S+[[:space:]]+password[[:space:]]+\S{2,}'
     'sudoers_nopasswd|^[[:space:]]*[^#][^[:space:]]*[[:space:]].*NOPASSWD[[:space:]]*[:=]'
     'samba_password|^[[:space:]]*(passwd|password|smb[[:space:]]+passwd)[[:space:]]*=[[:space:]]*[^[:space:]]{3,}'
+    # LDAP bind password (OpenLDAP/nslcd/sssd) and IPsec pre-shared key
+    'ldap_bindpw|(bindpw[[:space:]]+|ldap_default_authtok[[:space:]]*=[[:space:]]*)[^[:space:]#"]{3,}'
+    'ipsec_psk|:[[:space:]]*PSK[[:space:]]+"[^"]{3,}"'
+    # SNMP community strings (the real secrets live in directives, not in the
+    # commented `# snmpwalk -c public` examples which are comment-skipped).
+    'snmp_community|^[[:space:]]*(rocommunity6?|rwcommunity6?)[[:space:]]+[^[:space:]#]{2,}'
+    'snmp_com2sec|^[[:space:]]*com2sec6?[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]#]{2,}'
 
     # ── Specific config-file credential formats ──────────────────────────
     # Redis ACL / standalone:  requirepass MyR3disPw
@@ -550,11 +631,14 @@ FALSE_POSITIVE_EXACT=(
     password passwd pwd pass passphrase secret token
     null none nil undefined empty void true false
     example sample demo placeholder dummy fake stub mock lorem ipsum
-    test tester testing testpassword testpass test123 testing123
+    test tester testing
     foo bar baz qux foobar barbaz
-    abc 123 abc123 12345 123456 1234567 12345678 123456789
-    qwerty letmein iloveyou monkey dragon hunter2 'correct horse'
-    "p@ssw0rd" password123 password1 admin1 admin123
+    abc 123
+    # NOTE: weak/common passwords (qwerty, letmein, password123, p@ssw0rd,
+    # 123456, admin123, test123, ...) are DELIBERATELY *not* dropped here.
+    # On CTF/HTB boxes and real weak-credential findings those ARE the answer,
+    # so suppressing them would lose valid findings. Only unambiguous
+    # template/echo/masked values stay on this list.
     changeme change_me change-me changethis change-this changeit change-it
     todo fixme tbd "n/a" na
     your_password yourpassword your-password yourpasswordhere yourpwd
@@ -563,6 +647,12 @@ FALSE_POSITIVE_EXACT=(
     "<input>" "<enter>" "<here>" "<...>"
     "..." "...." "....." "********" "*****" "***" xxxxxxxx xxxxx xxx
     redacted hidden masked sanitized
+    # Clearly-non-password config values / field-name echoes (a password field
+    # whose value is one of these is an echo or stray non-secret, never a cred)
+    username email hostname host database value string text data
+    admin administrator
+    localhost 127.0.0.1 0.0.0.0 ::1 enabled disabled default auto unknown
+    "yes" "no" "on" "off" optional required mandatory
     # MS sysprep "Password" default placeholder, base64 UTF-16LE
     "uabhahmacwbvahiazaa=="
     # Common sysprep-cleaned marker
@@ -596,10 +686,44 @@ is_false_positive() {
         *placeholder|*placeholders|*_example|*_sample|*_dummy|*_mock|*_stub|*_fake|*_demo) return 0 ;;
     esac
 
+    # ── High-confidence placeholder phrases anywhere in the value ─────────
+    # These appear ONLY in templates/examples — never inside a real password
+    # — so substring matching is safe and does not lose valid findings.
+    case "$lower" in
+        *changeme*|*change_me*|*change-me*|*changethis*|*change_this*) return 0 ;;
+        *yourpassword*|*your_password*|*your-password*|*passwordhere*|*password_here*|*goeshere*) return 0 ;;
+        *placeholder*|*redacted*|*replaceme*|*replace_me*|*replacethis*|*replace_this*) return 0 ;;
+        *insertpassword*|*insert_password*|*enterpassword*|*enter_password*|*enteryour*) return 0 ;;
+        *tobeset*|*to_be_set*|*tobedefined*|*fillme*|*fill_me*|*fillinpassword*) return 0 ;;
+        *examplepassword*|*samplepassword*|*dummypassword*|*fakepassword*) return 0 ;;
+        # Space-separated vendor template defaults (WordPress wp-config-sample,
+        # etc.) — never appear inside a real password.
+        *'put your password here'*|*'your database password here'*|*'your password here'*|*'enter your password'*) return 0 ;;
+        *xxxxxx*) return 0 ;;   # 6+ masking chars
+    esac
+
+    # ── Value is a REFERENCE / lookup of a secret, not a literal ──────────
+    # (env var, vault read, secrets-manager call, config getter)
+    case "$lower" in
+        *getenv*|*os.environ*|*process.env*|*'env['*|*'$env{'*|*'@value('*) return 0 ;;
+        *keyvault*|*getsecret*|*secretsmanager*|*secretmanager*|*'vault.read'*|*hvac.*) return 0 ;;
+        *configurationmanager*|*boto3*|*'ssm.get'*|*getparameter*) return 0 ;;
+    esac
+
+    # ── Bare dotted identifier reference (config.dbPassword, settings.pass) ─
+    # A code reference, not a literal. ($-prefixed form handled further down.)
+    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
+
+    # ── Function-call accessor (getPassword(), get_password(), cfg.getSecret())
+    # — code that FETCHES a secret at runtime, not a hardcoded literal.
+    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$ ]] && return 0
+
     # Variable interpolation / template markers
     case "$v" in
         *'${'*|*'$('*|*'%('*|*'{{'*|*'<%'*|*'%>'*|*'#{'*) return 0 ;;
-        *'<'*'>'*) return 0 ;;
+        # Placeholder tag like <password> / <your-pw> (a letter must follow '<';
+        # keeps real passwords containing '<3' etc. that PS also keeps).
+        *'<'[A-Za-z_]*'>'*) return 0 ;;
         *'$1'*|*'$2'*|*'$3'*|*'$$'*) return 0 ;;
         *'%'[A-Z_]*'%'*) return 0 ;;
         *'@@'*|*'__'*'__'*) return 0 ;;
@@ -610,9 +734,12 @@ is_false_positive() {
     case "$v" in
         'self.'*|'this.'*|'cls.'*|'@self.'*) return 0 ;;
         '$_POST['*|'$_GET['*|'$_REQUEST['*|'$_SERVER['*|'$_ENV['*|'$_SESSION['*|'$_COOKIE['*) return 0 ;;
-        '$'[a-zA-Z_]*) return 0 ;;
-        # Dotted identifier referencing another field (no quotes)
     esac
+    # Dotted variable/field reference like $obj.field or $cred.Password
+    # (matches PS Test-FalsePositive). Bare $VAR and real passwords that
+    # merely start with '$' (e.g. $Pass123, $ecretP@ss) are intentionally
+    # KEPT — dropping them would miss genuine credentials.
+    [[ "$v" =~ ^\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
 
     # Already-encrypted / vaulted markers — these mean the secret is
     # protected at rest; we don't double-report them as plaintext.
@@ -631,13 +758,30 @@ is_false_positive() {
         *'trusted_connection=yes'*|*'trusted_connection=true'*) return 0 ;;
     esac
 
-    # Single repeating char (e.g. "xxxx", "****")
-    if [ "$len" -ge 3 ] && [[ "$v" =~ ^(.)\1+$ ]]; then
-        return 0
+    # Single repeating char (e.g. "xxxx", "****"). NOTE: bash's `[[ =~ ]]` is
+    # POSIX ERE and does NOT support back-references, so the old `^(.)\1+$`
+    # never matched (dead filter). Check character-by-character instead so this
+    # matches the PowerShell Test-FalsePositive behaviour. Value length is
+    # bounded (<=256) so the loop cost is negligible.
+    if [ "$len" -ge 3 ]; then
+        local c0="${v:0:1}" same=1 i
+        for ((i = 1; i < len; i++)); do
+            [ "${v:i:1}" = "$c0" ] || { same=0; break; }
+        done
+        [ "$same" -eq 1 ] && return 0
     fi
 
     # Only non-alphanumeric punctuation
     if [[ "$v" =~ ^[^A-Za-z0-9]+$ ]]; then
+        return 0
+    fi
+
+    # Bare filesystem path used as a value (e.g. `pwd: /usr/local/bin`,
+    # `password = /etc/secrets`) — a working-directory / path reference, not a
+    # secret. Require a leading /, ./ or ../, only path-safe characters (so any
+    # password with other punctuation or whitespace is untouched), and at least
+    # two path separators so single-segment values like `/x` are kept.
+    if [[ "$v" =~ ^(\.\.?/|/)[A-Za-z0-9._/-]+$ ]] && [[ "$v" == */*/* ]]; then
         return 0
     fi
 
@@ -693,7 +837,10 @@ should_skip_filename() {
         # Python project meta (cred-free)
         pyproject.toml|setup.cfg|MANIFEST.in|tox.ini|noxfile.py) return 0 ;;
         # Common build / make files (cred-free)
-        Makefile|GNUmakefile|CMakeLists.txt|meson.build|build.gradle|gradle.properties|pom.xml) return 0 ;;
+        Makefile|GNUmakefile|CMakeLists.txt|meson.build|pom.xml) return 0 ;;
+        # NOTE: build.gradle / gradle.properties are NOT skipped -- they
+        # commonly hold repo / signing / nexus passwords (signing.password,
+        # mavenPassword, nexusPassword, ...).
         # OS / desktop noise
         .DS_Store|Thumbs.db|desktop.ini|*.lnk) return 0 ;;
         # Minified / bundled / source-map artefacts (never carry real creds,
@@ -703,24 +850,29 @@ should_skip_filename() {
         # Gettext / localisation files
         *.po|*.pot|*.mo) return 0 ;;
         # .env templates / examples / dist files — by definition placeholders,
-        # not real creds. They are still flagged as [CRED_FILE] by stage 4.
+        # not real creds. They are still flagged by stage 4 (filename match).
         .env.example|.env.sample|.env.template|.env.dist) return 0 ;;
         *.env.example|*.env.sample|*.env.template|*.env.dist) return 0 ;;
     esac
     return 1
 }
 
-# Binary detection: examine first 4 KB only. Empty files are also flagged
-# as "binary" because there's nothing to scan.
+# Binary detection in a SINGLE fork. `grep -I` treats a file containing NUL
+# bytes as binary (no match); an empty file likewise yields no match; `-m1`
+# stops at the first text line so we never read more than one line of a text
+# file. Replaces the old `head -c 4096 | grep` two-fork pipeline.
 is_binary() {
-    ! head -c 4096 -- "$1" 2>/dev/null | grep -qI . 2>/dev/null
+    ! LC_ALL=C grep -qIm1 . -- "$1" 2>/dev/null
 }
 
 sanitize() {
     local v="$1"
     v="${v//$'\r'/}"
     v="${v//$'\n'/ }"
-    v="$(printf '%s' "$v" | tr -s '[:space:]' ' ')"
+    # Drop terminal control bytes (ESC/BEL/backspace/etc.) from scanned content
+    # so neither the live output nor the on-disk log can carry escape sequences;
+    # then collapse remaining whitespace runs to single spaces.
+    v="$(printf '%s' "$v" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | tr -s '[:space:]' ' ')"
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
     if [ "${#v}" -gt "$MAX_PREVIEW_LEN" ]; then
@@ -729,32 +881,39 @@ sanitize() {
     printf '%s' "$v"
 }
 
+# Collapse TAB/CR/LF in a path so it stays a single, column-stable field in the
+# TAB-separated tier files. Filenames may legally contain these bytes, and since
+# enumeration is NUL-safe a newline in a path would otherwise split a TSV record
+# into two phantom lines (wrong line numbers / garbled paths). Result -> REPLY
+# (no subshell, so this stays cheap on the per-file record_skip/record_checked).
+_clean_path() { REPLY="${1//$'\t'/ }"; REPLY="${REPLY//$'\r'/ }"; REPLY="${REPLY//$'\n'/ }"; }
+
 record_finding() {
     # Args: BUCKET LABEL FILE LINE PREVIEW
     local bucket="$1" label="$2" file="$3" line="$4" preview="$5"
+    _clean_path "$file"; file="$REPLY"
     case "$bucket" in
         HIGH) printf '%s\t%s\t%s\t%s\n' "$label" "$file" "$line" "$preview" >>"$HIGH_FILE" ;;
         KEY)  printf '%s\t%s\t%s\t%s\n' "$label" "$file" "$line" "$preview" >>"$KEY_FILE"  ;;
     esac
-    [ "$IN_STAGE1" -eq 1 ] && stage1_emit "$bucket" "$label" "$file" "$line"
+    [ "$IN_STAGE1" -eq 1 ] && stage1_emit "$bucket" "$label" "$file" "$line" "$preview"
 }
 record_interest() {
-    printf '%s\t%s\n' "$1" "$2" >>"$INTEREST_FILE"
-    [ "$IN_STAGE1" -eq 1 ] && stage1_emit INTEREST "$1" "$2"
+    _clean_path "$2"
+    printf '%s\t%s\n' "$1" "$REPLY" >>"$INTEREST_FILE"
+    [ "$IN_STAGE1" -eq 1 ] && stage1_emit INTEREST "$1" "$REPLY"
 }
 record_name() {
-    printf '%s\n' "$1" >>"$NAME_FILE"
-    [ "$IN_STAGE1" -eq 1 ] && stage1_emit NAME "name_match" "$1"
+    _clean_path "$1"
+    printf '%s\n' "$REPLY" >>"$NAME_FILE"
+    [ "$IN_STAGE1" -eq 1 ] && stage1_emit NAME "name_match" "$REPLY"
 }
-record_exact() {
-    printf '%s\n' "$1" >>"$EXACT_FILE"
-    [ "$IN_STAGE1" -eq 1 ] && stage1_emit CRED_FILE "exact_name" "$1"
-}
-record_skip()        { printf '%s\t%s\n' "$1" "$2" >>"$SKIPPED_FILE"; }
-record_checked()     { printf '%s\t%s\n' "$1" "$2" >>"$CHECKED_FILE"; }
+record_skip()        { _clean_path "$1"; printf '%s\t%s\n' "$REPLY" "$2" >>"$SKIPPED_FILE"; }
+record_checked()     { _clean_path "$2"; printf '%s\t%s\n' "$1" "$REPLY" >>"$CHECKED_FILE"; }
 record_guaranteed() {
-    printf '%s\t%s\n' "$1" "$2" >>"$GUARANTEED_FILE"
-    [ "$IN_STAGE1" -eq 1 ] && stage1_emit CRITICAL "$1" "$2"
+    _clean_path "$2"
+    printf '%s\t%s\n' "$1" "$REPLY" >>"$GUARANTEED_FILE"
+    [ "$IN_STAGE1" -eq 1 ] && stage1_emit CRITICAL "$1" "$REPLY"
 }
 
 # ----------------------------------------------------------------------------
@@ -798,7 +957,6 @@ end_progress() {
 declare -A STAGE_BEFORE_GUARANTEED
 declare -A STAGE_BEFORE_INTEREST
 declare -A STAGE_BEFORE_NAME
-declare -A STAGE_BEFORE_EXACT
 declare -A STAGE_BEFORE_HIGH
 declare -A STAGE_BEFORE_KEY
 declare -A STAGE_START_TIME
@@ -810,7 +968,6 @@ stage_begin() {
     STAGE_BEFORE_GUARANTEED[$n]=$(wc -l <"$GUARANTEED_FILE" 2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_INTEREST[$n]=$(wc -l <"$INTEREST_FILE"   2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_NAME[$n]=$(wc -l <"$NAME_FILE"           2>/dev/null | tr -d ' ' || echo 0)
-    STAGE_BEFORE_EXACT[$n]=$(wc -l <"$EXACT_FILE"         2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_HIGH[$n]=$(wc -l <"$HIGH_FILE"           2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_KEY[$n]=$(wc -l <"$KEY_FILE"             2>/dev/null | tr -d ' ' || echo 0)
     STAGE_START_TIME[$n]=$(date +%s.%N 2>/dev/null || date +%s)
@@ -827,21 +984,19 @@ stage_end() {
     elapsed=$(awk -v a="${STAGE_START_TIME[$n]:-0}" -v b="$end" \
         'BEGIN{ d=b-a; if(d<0)d=0; printf "%.2f", d }')
 
-    local now_guar now_int now_name now_ex now_hi now_ky
+    local now_guar now_int now_name now_hi now_ky
     now_guar=$(wc -l <"$GUARANTEED_FILE" 2>/dev/null | tr -d ' ' || echo 0)
     now_int=$(wc -l <"$INTEREST_FILE"    2>/dev/null | tr -d ' ' || echo 0)
     now_name=$(wc -l <"$NAME_FILE"       2>/dev/null | tr -d ' ' || echo 0)
-    now_ex=$(wc -l <"$EXACT_FILE"        2>/dev/null | tr -d ' ' || echo 0)
     now_hi=$(wc -l <"$HIGH_FILE"         2>/dev/null | tr -d ' ' || echo 0)
     now_ky=$(wc -l <"$KEY_FILE"          2>/dev/null | tr -d ' ' || echo 0)
 
     local d_guar=$(( now_guar - ${STAGE_BEFORE_GUARANTEED[$n]:-0} ))
     local d_int=$((  now_int  - ${STAGE_BEFORE_INTEREST[$n]:-0}   ))
     local d_name=$(( now_name - ${STAGE_BEFORE_NAME[$n]:-0}       ))
-    local d_ex=$((   now_ex   - ${STAGE_BEFORE_EXACT[$n]:-0}      ))
     local d_hi=$((   now_hi   - ${STAGE_BEFORE_HIGH[$n]:-0}       ))
     local d_ky=$((   now_ky   - ${STAGE_BEFORE_KEY[$n]:-0}        ))
-    local total=$(( d_guar + d_int + d_name + d_ex + d_hi + d_ky ))
+    local total=$(( d_guar + d_int + d_name + d_hi + d_ky ))
 
     printf '\n%b======================================================================%b\n' "$C" "$NC"
     printf '%b  Stage %s -- %s%b\n' "$BOLD" "$n" "$title" "$NC"
@@ -854,7 +1009,6 @@ stage_end() {
         stage_print_delta HIGH      "$HIGH_FILE"       "${STAGE_BEFORE_HIGH[$n]:-0}"       "$d_hi"
         stage_print_delta KEY       "$KEY_FILE"        "${STAGE_BEFORE_KEY[$n]:-0}"        "$d_ky"
         stage_print_delta INTEREST  "$INTEREST_FILE"   "${STAGE_BEFORE_INTEREST[$n]:-0}"   "$d_int"
-        stage_print_delta CRED_FILE "$EXACT_FILE"      "${STAGE_BEFORE_EXACT[$n]:-0}"      "$d_ex"
         stage_print_delta NAME      "$NAME_FILE"       "${STAGE_BEFORE_NAME[$n]:-0}"       "$d_name"
     fi
     printf '%b======================================================================%b\n' "$C" "$NC"
@@ -871,7 +1025,7 @@ stage_print_delta() {
         HIGH|KEY)
             tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ printf "  [%-9s]  %s\n", t, $2 }'
             ;;
-        INTEREST|CRED_FILE|NAME)
+        INTEREST|NAME)
             tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ p=$NF; printf "  [%-9s]  %s\n", t, p }'
             ;;
         CRITICAL)
@@ -906,6 +1060,13 @@ stage_skipped() {
 classify_line() {
     local content="$1" file="$2" lineno="$3" source_label="$4"
 
+    # Skip pathologically long / trivially short lines before any regex work.
+    # Bounds the per-pattern [[ =~ ]] loop on minified/base64/log lines (DoS
+    # guard) and matches the PowerShell engine's per-line gate for parity.
+    local _clen=${#content}
+    [ "$_clen" -gt "$MAX_LINE_LEN" ] && return 1
+    [ "$_clen" -lt 6 ] && return 1
+
     # ── Line-level hard-coded FPs (observed on real Windows hosts) ────────
     # MSSQL @password parameter references in stored procedures
     [[ "$content" =~ @password[[:space:]]*=[[:space:]]*(@password|N\'\'|NULL|@[A-Za-z_]+) ]] && return 1
@@ -922,6 +1083,19 @@ classify_line() {
         label="${entry%%|*}"
         regex="${entry#*|}"
         if [[ "$content" =~ $regex ]]; then
+            # ── Commented example skip ───────────────────────────────────
+            # Stock configs ship docs like `# snmpwalk -c public` or
+            # `# rocommunity public` — examples, not live creds. Skip comment
+            # lines ONLY for command/directive patterns. Generic key=value
+            # assignments (password_assign, db_password, ...) are tried first
+            # and are NOT skipped, so a commented-out real password is still
+            # reported.
+            if [[ "$content" =~ ^[[:space:]]*(#|//|\;|[Rr][Ee][Mm][[:space:]]) ]]; then
+                case "$label" in
+                    *_cmd|*_pass|cmdline_pw_flag|impacket_cred|runas_savecred|cmdkey_add|net_user_create|chpasswd_*|passwd_stdin|ps_localuser|ps_adsetpass|ps_secstring_*|htpasswd_create|nmcli_wifi|useradd_pass|snmp_community|snmp_com2sec)
+                        return 1 ;;
+                esac
+            fi
             # ── Smarter value extraction ─────────────────────────────────
             # The OLD code took the substring after the FIRST `:`/`=`. That
             # misfires on timestamps ("03:39:54 SVCPASSWORD: source = X")
@@ -929,7 +1103,7 @@ classify_line() {
             # keyword instead, then read whatever immediately follows ITS
             # operator. Falls back to the full content if no kv shape.
             value="$content"
-            if [[ "$content" =~ (password|passwd|passphrase|pwd|cpassword|requirepass|rootpw|cred(ential)?s?|secret)[[:space:]]*[:=]?[[:space:]]*(.+)$ ]]; then
+            if [[ "$content" =~ (password|passwd|passphrase|pass|pwd|cpassword|requirepass|rootpw|cred(ential)?s?|secret)[[:space:]]*[:=]?[[:space:]]*(.+)$ ]]; then
                 value="${BASH_REMATCH[3]}"
                 value="${value%%#*}"
                 value="${value%%;*}"
@@ -938,15 +1112,31 @@ classify_line() {
                 value="${value%% -> *}"
                 value="${value%%, source*}"
             fi
-            # Skip the generic FP filter for findings where the FULL match
-            # IS the credential (hash dumps, format-anchored markers, XML
-            # value tags, free-form auth-line formats).
+            # PHP 'key' => 'value' / define('KEY','value') shapes: the generic
+            # extractor above leaves a messy "=> 'value'" prefix, so take the
+            # last quoted literal on the line as the value before FP-filtering
+            # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
-                ntlm_dump|ntds_dump|shadow_*|krb5_*|mscash_*|htpasswd_*|gpp_cpassword) ;;
-                unattend_password|autologon_password) ;;
-                netrc_password|sudoers_nopasswd|samba_password) ;;
-                wp_db_password|joomla_password|drupal_password) ;;
+                drupal_password|wp_db_password)
+                    if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
+                        value="${BASH_REMATCH[1]}"
+                    fi
+                    ;;
+            esac
+            # Skip the generic FP filter ONLY for findings where the FULL match
+            # IS the credential (hash dumps, format-anchored markers, XML value
+            # tags, free-form auth-line formats). Patterns whose value is an
+            # ordinary user string (autologon/drupal/wp/htpasswd_create) are
+            # NOT here — they must run through is_false_positive so placeholders
+            # and variable references are dropped.
+            case "$label" in
+                ntlm_dump|ntds_dump|shadow_*|krb5_*|mscash_*|htpasswd_hash|gpp_cpassword) ;;
+                unattend_password) ;;
+                netrc_password|sudoers_nopasswd) ;;
+                joomla_password) ;;
+                define_secret|php_db_connect) ;;
                 redis_requirepass|anaconda_rootpw) ;;
+                ldap_bindpw|ipsec_psk|snmp_community|snmp_com2sec) ;;
                 *)
                     is_false_positive "$value" && return 1
                     ;;
@@ -965,11 +1155,20 @@ scan_file() {
     # Skip our own script
     [ "$file" = "$SCRIPT_PATH" ] && return
 
-    # Per-path dedup using canonical path
-    local canon
-    canon=$(readlink -f -- "$file" 2>/dev/null || printf '%s' "$file")
-    [ -n "${SCANNED_PATHS["$canon"]:-}" ] && return
-    SCANNED_PATHS["$canon"]=1
+    # Per-path dedup. Stage 1's targeted lists can reference the same file
+    # under different names / symlinks, so it keys on the canonical path
+    # (one readlink fork per Stage-1 file — a small fixed list). Stage 5's
+    # candidate list is already `sort -u` unique and `find` does not follow
+    # symlinks, so a literal-path key is sufficient there and avoids ~1
+    # readlink fork per file across the entire tree.
+    local key
+    if [ "$IN_STAGE1" -eq 1 ]; then
+        key=$(readlink -f -- "$file" 2>/dev/null || printf '%s' "$file")
+    else
+        key="$file"
+    fi
+    [ -n "${SCANNED_PATHS["$key"]:-}" ] && return
+    SCANNED_PATHS["$key"]=1
 
     [ -f "$file" ] || return
 
@@ -982,12 +1181,18 @@ scan_file() {
 
     [ -r "$file" ] || { record_skip "$file" "unreadable"; return; }
 
-    local sz
-    sz=$(file_size "$file")
-    [ "$sz" -le 0 ] && return
-    if [ "$SKIP_LARGE" -eq 1 ] && [ "$sz" -gt $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; then
-        record_skip "$file" "size>${MAX_FILE_SIZE_MB}MB"
-        return
+    # Size gate. In Stage 5 the candidate list was already size-filtered by
+    # `find -size` (see enumerate_candidates) when a cap is active, so the
+    # per-file stat is only needed for Stage 1's targeted files. Empty files
+    # are caught by is_binary below (grep -I yields no match on 0 bytes).
+    if [ "$IN_STAGE1" -eq 1 ]; then
+        local sz
+        sz=$(file_size "$file")
+        [ "$sz" -le 0 ] && return
+        if [ "$SKIP_LARGE" -eq 1 ] && [ "$sz" -gt $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; then
+            record_skip "$file" "size>${MAX_FILE_SIZE_MB}MB"
+            return
+        fi
     fi
     is_binary "$file" && { record_skip "$file" "binary"; return; }
 
@@ -1016,7 +1221,31 @@ scan_file() {
         if classify_line "$content" "$file" "$lineno" "$source_label"; then
             matches_found=$((matches_found + 1))
         fi
-    done < <(grep -niE -m "$MAX_MATCHES_PER_FILE" -- "$COMBINED_CRED_REGEX" "$file" 2>/dev/null)
+    done < <(grep -niE -m "$PREFILTER_LINE_CAP" -- "$COMBINED_CRED_REGEX" "$file" 2>/dev/null)
+
+    # ── Phase 3: multi-line XML credential tags (unattend.xml / sysprep) ──
+    # Real autologon blocks split <Password> and <Value> across lines, which
+    # the per-line scan above cannot match. Scoped to XML/INF-type files (rare,
+    # so the whole-file read stays cheap) and skipped when the single-line form
+    # already matched in Phase 2 (avoids double-reporting the same finding).
+    case "${file,,}" in
+        *.xml|*.inf|*.unattend|*.answerfile)
+            if ! grep -qiE '<(Administrator)?Password>[[:space:]]*<Value>[^[:space:]<]' "$file" 2>/dev/null; then
+                local xml_content xml_val pline
+                xml_content=$(LC_ALL=C tr -d '\000\r' <"$file")
+                if [[ "$xml_content" =~ \<(Administrator)?Password\>[[:space:]]*\<Value\>[[:space:]]*([^\<]{2,}) ]]; then
+                    xml_val="${BASH_REMATCH[2]}"
+                    xml_val="${xml_val%"${xml_val##*[![:space:]]}"}"   # rtrim
+                    xml_val="${xml_val#"${xml_val%%[![:space:]]*}"}"   # ltrim
+                    if [ -n "$xml_val" ] && ! is_false_positive "$xml_val"; then
+                        pline=$(grep -niE -m1 '<(Administrator)?Password>' "$file" 2>/dev/null)
+                        pline="${pline%%:*}"; [[ "$pline" =~ ^[0-9]+$ ]] || pline=1
+                        record_finding HIGH "${source_label}/unattend_password" "$file" "$pline" "$(sanitize "Password Value: $xml_val")"
+                    fi
+                fi
+            fi
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -1180,7 +1409,14 @@ check_web_apps() {
 check_home_dotfiles() {
     info "Stage 1.8 — high-value dotfiles in home dirs"
     local f
-    while IFS= read -r -d '' f; do scan_file "$f" "dotfile"
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            # FileZilla stores <Pass encoding="base64">…</Pass> which the
+            # content regex cannot decode — always list it for manual review.
+            */filezilla/sitemanager.xml|*/filezilla/recentservers.xml|*/filezilla/filezilla.xml)
+                record_interest "filezilla_session" "$f" ;;
+        esac
+        scan_file "$f" "dotfile"
     done < <(find /root /home -maxdepth 4 -type f \( \
         -name '.netrc' -o -name '_netrc' -o -name '.git-credentials' \
         -o -name '.gitconfig' -o -name '.npmrc' -o -name '.pypirc' \
@@ -1188,6 +1424,19 @@ check_home_dotfiles() {
         -o -path '*/.azure/*' -o -path '*/.config/rclone/rclone.conf' \
         -o -path '*/.config/filezilla/sitemanager.xml' \
         -o -path '*/.config/filezilla/recentservers.xml' \
+        -o -path '*/.config/filezilla/filezilla.xml' \
+        \) -print0 2>/dev/null)
+
+    # gcloud CLI credential stores (sqlite DB + ADC json). The DBs are binary,
+    # so flag for manual review; the JSON ADC files are also content-scanned.
+    while IFS= read -r -d '' f; do
+        record_interest "cloud_credential_file" "$f"
+        case "$f" in *.json) scan_file "$f" "gcloud" ;; esac
+    done < <(find /root /home -maxdepth 6 -type f \( \
+        -path '*/.config/gcloud/credentials.db' \
+        -o -path '*/.config/gcloud/access_tokens.db' \
+        -o -path '*/.config/gcloud/application_default_credentials.json' \
+        -o -path '*/.config/gcloud/legacy_credentials/*' \
         \) -print0 2>/dev/null)
 
     # Browser credential stores: flag for offline decryption only
@@ -1293,7 +1542,11 @@ check_misc_services() {
     while IFS= read -r -d '' f; do
         case "$(basename "$f")" in
             passwd) record_interest "vnc_passwd_d3des" "$f" ;;  # binary, d3des-encoded
-            *.remmina) scan_file "$f" "remmina_session" ;;
+            *.remmina)
+                # Remmina stores password=<base64/3DES> which the content regex
+                # cannot decode — always list the session file for manual review.
+                record_interest "remmina_session" "$f"
+                scan_file "$f" "remmina_session" ;;
         esac
     done < <(find /root /home -maxdepth 5 -type f \( \
         -path '*/.vnc/passwd' -o -path '*/.config/remmina/*.remmina' \
@@ -1419,53 +1672,40 @@ EXCLUDE_PATHS=(
 #  Stages 2-5 — recursive scanning of user-supplied paths
 # ============================================================================
 
+# Build the find pruning expression ONCE as an argv ARRAY (no eval, no quoting
+# games, no command-injection surface from scan/exclude paths). FIND_EXCLUDE_ARGS
+# expands to:  ( -type d -name X -o -path Y -o -path Y/* ... ) -prune -o
+# which find reads as "prune these subtrees, otherwise fall through to the match
+# expression that follows". Reused by every stage.
+FIND_EXCLUDE_ARGS=()
 build_find_excludes() {
-    # Compose once, reuse forever.
-    [ -n "$FIND_EXCLUDES_CACHE" ] && { printf '%s' "$FIND_EXCLUDES_CACHE"; return; }
-    local exprs="" first=1 d
+    [ "${#FIND_EXCLUDE_ARGS[@]}" -gt 0 ] && return   # compose once, reuse forever
+    local d inner=()
     for d in "${EXCLUDE_DIR_NAMES[@]}"; do
-        if [ "$first" -eq 1 ]; then
-            exprs="-type d -name '${d}'"
-            first=0
-        else
-            exprs+=" -o -type d -name '${d}'"
-        fi
+        inner+=( -o -type d -name "$d" )
     done
     for d in "${EXCLUDE_PATHS[@]}"; do
-        if [ "$first" -eq 1 ]; then
-            exprs="-path '${d}' -o -path '${d}/*'"
-            first=0
-        else
-            exprs+=" -o -path '${d}' -o -path '${d}/*'"
-        fi
+        inner+=( -o -path "$d" -o -path "$d/*" )
     done
-    if [ -n "$exprs" ]; then
-        FIND_EXCLUDES_CACHE=$(printf -- '\\( %s \\) -prune -o' "$exprs")
-    fi
-    printf '%s' "$FIND_EXCLUDES_CACHE"
+    # Drop the leading "-o" (inner[@]:1) and wrap in a ( ... ) -prune -o group.
+    [ "${#inner[@]}" -gt 0 ] && FIND_EXCLUDE_ARGS=( '(' "${inner[@]:1}" ')' -prune -o )
 }
 
 # Stage 2 — confirmed credential containers
 find_guaranteed_credentials() {
-    local path e ext_expr="" first=1
+    build_find_excludes
+    local path e match=()
     for e in "${STAGE2_EXTENSIONS[@]}"; do
-        if [ "$first" -eq 1 ]; then
-            ext_expr=" \( -iname '*.${e}'"; first=0
-        else
-            ext_expr+=" -o -iname '*.${e}'"
-        fi
+        match+=( -o -iname "*.${e}" )
     done
-    ext_expr+=" \)"
-    local excludes; excludes=$(build_find_excludes)
-    local count=0
+    local name_expr=( '(' "${match[@]:1}" ')' )
     for path in "${SCAN_PATHS[@]}"; do
         [ -e "$path" ] || continue
-        while IFS= read -r f; do
+        while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
             local ext_only="${f##*.}"
             record_guaranteed "${ext_only,,}" "$f"
-            count=$((count + 1))
-        done < <(eval "find \"$path\" $excludes -type f $ext_expr -print" 2>/dev/null)
+        done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
     done
     if [ -s "$GUARANTEED_FILE" ]; then
         sort -u "$GUARANTEED_FILE" -o "$GUARANTEED_FILE"
@@ -1481,8 +1721,8 @@ find_guaranteed_credentials() {
 # Files already flagged by Stage 2 (guaranteed credential containers) are
 # deduped against $GUARANTEED_FILE so e.g. *.keytab doesn't double-emit.
 find_high_value_files() {
+    build_find_excludes
     local path
-    local excludes; excludes=$(build_find_excludes)
 
     # Build dedup set from Stage 2 outputs (TSV: ext<TAB>path -> use column 2)
     declare -A STAGE2_HITS=()
@@ -1493,52 +1733,16 @@ find_high_value_files() {
         done <"$GUARANTEED_FILE"
     fi
 
-    # ---- Pass 1: extensions ----
-    local ext_expr="" first=1 e
-    for e in "${STAGE3_EXTENSIONS[@]}"; do
-        if [ "$first" -eq 1 ]; then
-            ext_expr=" \\( -iname '*.${e}'"; first=0
-        else
-            ext_expr+=" -o -iname '*.${e}'"
-        fi
-    done
-    [ -n "$ext_expr" ] && ext_expr+=" \\)"
+    # One combined match expression: extensions OR exact filenames OR globs.
+    local match=() e n gp
+    for e  in "${STAGE3_EXTENSIONS[@]}";    do match+=( -o -iname "*.${e}" ); done
+    for n  in "${STAGE3_EXACT_NAMES[@]}";   do match+=( -o -iname "$n" );     done
+    for gp in "${STAGE3_GLOB_PATTERNS[@]}"; do match+=( -o -iname "$gp" );    done
+    local name_expr=( '(' "${match[@]:1}" ')' )
 
-    # ---- Pass 2: exact filenames ----
-    local name_expr="" first2=1 n
-    for n in "${STAGE3_EXACT_NAMES[@]}"; do
-        if [ "$first2" -eq 1 ]; then
-            name_expr=" \\( -iname '${n}'"; first2=0
-        else
-            name_expr+=" -o -iname '${n}'"
-        fi
-    done
-    [ -n "$name_expr" ] && name_expr+=" \\)"
-
-    # ---- Pass 3: glob patterns ----
-    local glob_expr="" first3=1 gp
-    for gp in "${STAGE3_GLOB_PATTERNS[@]}"; do
-        if [ "$first3" -eq 1 ]; then
-            glob_expr=" \\( -iname '${gp}'"; first3=0
-        else
-            glob_expr+=" -o -iname '${gp}'"
-        fi
-    done
-    [ -n "$glob_expr" ] && glob_expr+=" \\)"
-
-    # Compose: extension OR exact-name OR glob
-    local combined="" clause
-    for clause in "$ext_expr" "$name_expr" "$glob_expr"; do
-        [ -z "$clause" ] && continue
-        if [ -z "$combined" ]; then combined="$clause"
-        else combined="\\( $combined -o $clause \\)"
-        fi
-    done
-
-    local count=0
     for path in "${SCAN_PATHS[@]}"; do
         [ -e "$path" ] || continue
-        while IFS= read -r f; do
+        while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
             # Stage 2 dedup -- skip files already flagged as guaranteed
             [ -n "${STAGE2_HITS[$f]:-}" ] && continue
@@ -1550,8 +1754,7 @@ find_high_value_files() {
             done
             [ "$skip" -eq 1 ] && continue
             record_interest "high_value_file" "$f"
-            count=$((count + 1))
-        done < <(eval "find \"$path\" $excludes -type f $combined -print" 2>/dev/null)
+        done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
     done
 }
 
@@ -1565,16 +1768,27 @@ find_high_value_files() {
 # etc.) at non-standard paths, add their identifying substring (e.g. "rsa",
 # "shadow", "history") to STAGE4_NAME_TOKENS at the top of this script.
 find_suspicious_filenames() {
-    local path
-    local excludes; excludes=$(build_find_excludes)
-
-    local count=0 self_name
+    build_find_excludes
+    local path self_name
     self_name="${SCRIPT_PATH##*/}"
+
+    # Dedup against Stage 2: a confirmed credential container (e.g.
+    # passwords.kdbx, secrets.ppk) is already reported as [CRITICAL]; do not
+    # also down-tag it as a mere [NAME] substring hit.
+    declare -A STAGE2_HITS=()
+    if [ -s "$GUARANTEED_FILE" ]; then
+        local _g
+        while IFS=$'\t' read -r _ _g; do
+            [ -n "$_g" ] && STAGE2_HITS["$_g"]=1
+        done <"$GUARANTEED_FILE"
+    fi
 
     for path in "${SCAN_PATHS[@]}"; do
         [ -e "$path" ] || continue
-        while IFS= read -r f; do
+        while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            # Skip files already flagged as confirmed containers in Stage 2
+            [ -n "${STAGE2_HITS[$f]:-}" ] && continue
             local bn="${f##*/}"
             local bn_lower="${bn,,}"
             # Skip our own script
@@ -1583,59 +1797,60 @@ find_suspicious_filenames() {
             for t in "${STAGE4_NAME_TOKENS[@]}"; do
                 if [[ "$bn_lower" == *"${t,,}"* ]]; then
                     record_name "$f"
-                    count=$((count + 1))
                     break
                 fi
             done
         # -mindepth 1 prevents the SCAN_PATH itself from being flagged
         # (running with -p /etc/passwd shouldn't emit /etc/passwd as a finding).
-        done < <(eval "find \"$path\" -mindepth 1 $excludes -type f \
+        done < <(find "$path" -mindepth 1 "${FIND_EXCLUDE_ARGS[@]}" -type f \
             ! -iname '*.dll' ! -iname '*.exe' ! -iname '*.sys' ! -iname '*.so' \
             ! -iname '*.dylib' ! -iname '*.ocx' ! -iname '*.pdb' ! -iname '*.nupkg' \
             ! -iname '*.mui' ! -iname '*.cpl' ! -iname '*.drv' \
-            -print" 2>/dev/null)
+            -print0 2>/dev/null)
     done
 }
 
 # Stage 5 — recursive content scan of extension-matched candidates
 enumerate_candidates() {
-    local path size_bytes size_filter=""
-    size_bytes=$((MAX_FILE_SIZE_MB * 1024 * 1024))
-    [ "$SKIP_LARGE" -eq 1 ] && size_filter="-size -${size_bytes}c"
-    local excludes; excludes=$(build_find_excludes)
+    build_find_excludes
+    local path
+    local size_args=()
+    [ "$SKIP_LARGE" -eq 1 ] && size_args=( -size "-$((MAX_FILE_SIZE_MB * 1024 * 1024))c" )
+
+    # Build the extension/name match expression ONCE as an argv array (it is
+    # identical for every -p path). Empty in --all mode, where every file under
+    # the (pruned) tree is a candidate.
+    local name_args=()
+    if [ "$ALL_MODE" -eq 0 ]; then
+        local e
+        for e in "${STAGE5_EXTENSIONS[@]}"; do name_args+=( -o -iname "*.${e}" ); done
+        name_args+=( -o -iname 'Dockerfile' -o -iname 'Vagrantfile' -o -iname 'Makefile' -o -iname 'Jenkinsfile' )
+        name_args+=( -o -iname '.env*' -o -iname '*rc' -o -iname 'authorized_keys' )
+        name_args+=( -o -iname 'id_rsa' -o -iname 'id_dsa' -o -iname 'id_ecdsa' )
+        name_args+=( -o -iname 'id_ed25519' -o -iname 'identity' -o -iname 'id_*' )
+        name_args+=( -o -iname '.htpasswd' -o -iname 'htpasswd' -o -iname 'shadow' )
+        # Extension-less auth files (so `-p /etc` scans them without Stage 1)
+        name_args+=( -o -iname 'gshadow' -o -iname 'sudoers' -o -iname 'opasswd' )
+        name_args+=( -o -iname '.netrc' -o -iname '_netrc' -o -iname '.git-credentials' )
+        name_args+=( -o -iname '.gitconfig' -o -iname '.npmrc' -o -iname '.pypirc' )
+        name_args+=( -o -iname '.s3cfg' -o -iname '.boto' -o -iname '.viminfo' )
+        name_args+=( -o -iname '.psqlrc' -o -iname '.mysqlrc' -o -iname '.my.cnf' )
+        # Shell/tool history files frequently contain command-line creds
+        # (sshpass -p, mysql -pXXX, PGPASSWORD=, curl -u, etc.)
+        name_args+=( -o -iname '.bash_history' -o -iname '.zsh_history' -o -iname '.sh_history' )
+        name_args+=( -o -iname '.ksh_history' -o -iname '.ash_history' -o -iname '.history' )
+        name_args+=( -o -iname '.psql_history' -o -iname '.mysql_history' -o -iname '.sqlite_history' )
+        name_args+=( -o -iname '.python_history' -o -iname '.node_repl_history' )
+        name_args+=( -o -iname '.irb_history' -o -iname '.rediscli_history' -o -iname '.lesshst' )
+    fi
+
     for path in "${SCAN_PATHS[@]}"; do
         [ -e "$path" ] || { warn "Path does not exist: $path"; continue; }
         if [ "$ALL_MODE" -eq 1 ]; then
-            # shellcheck disable=SC2046
-            find "$path" $excludes -type f $size_filter -print 2>/dev/null
+            find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" -print0 2>/dev/null
         else
-            local ext_expr=""
-            local first=1 e
-            for e in "${STAGE5_EXTENSIONS[@]}"; do
-                if [ "$first" -eq 1 ]; then
-                    ext_expr=" \( -iname '*.${e}'"; first=0
-                else
-                    ext_expr+=" -o -iname '*.${e}'"
-                fi
-            done
-            ext_expr+=" -o -iname 'Dockerfile' -o -iname 'Vagrantfile' -o -iname 'Makefile' -o -iname 'Jenkinsfile'"
-            ext_expr+=" -o -iname '.env*' -o -iname '*rc' -o -iname 'authorized_keys'"
-            ext_expr+=" -o -iname 'id_rsa' -o -iname 'id_dsa' -o -iname 'id_ecdsa'"
-            ext_expr+=" -o -iname 'id_ed25519' -o -iname 'identity' -o -iname 'id_*'"
-            ext_expr+=" -o -iname '.htpasswd' -o -iname 'htpasswd' -o -iname 'shadow'"
-            ext_expr+=" -o -iname '.netrc' -o -iname '_netrc' -o -iname '.git-credentials'"
-            ext_expr+=" -o -iname '.gitconfig' -o -iname '.npmrc' -o -iname '.pypirc'"
-            ext_expr+=" -o -iname '.s3cfg' -o -iname '.boto' -o -iname '.viminfo'"
-            ext_expr+=" -o -iname '.psqlrc' -o -iname '.mysqlrc' -o -iname '.my.cnf'"
-            # Shell/tool history files frequently contain command-line creds
-            # (sshpass -p, mysql -pXXX, PGPASSWORD=, curl -u, etc.)
-            ext_expr+=" -o -iname '.bash_history' -o -iname '.zsh_history' -o -iname '.sh_history'"
-            ext_expr+=" -o -iname '.ksh_history' -o -iname '.ash_history' -o -iname '.history'"
-            ext_expr+=" -o -iname '.psql_history' -o -iname '.mysql_history' -o -iname '.sqlite_history'"
-            ext_expr+=" -o -iname '.python_history' -o -iname '.node_repl_history'"
-            ext_expr+=" -o -iname '.irb_history' -o -iname '.rediscli_history' -o -iname '.lesshst' \)"
-            # shellcheck disable=SC2046
-            eval "find \"$path\" $excludes -type f $size_filter $ext_expr -print" 2>/dev/null
+            local name_expr=( '(' "${name_args[@]:1}" ')' )
+            find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" "${name_expr[@]}" -print0 2>/dev/null
         fi
     done
 }
@@ -1643,17 +1858,18 @@ enumerate_candidates() {
 scan_user_paths_contents() {
     [ ${#SCAN_PATHS[@]} -eq 0 ] && { warn "No paths provided; skipping."; return; }
     info "Enumerating candidate files…"
+    # NUL-delimited throughout so filenames containing spaces/newlines survive.
     enumerate_candidates >"$CANDIDATE_FILES" 2>/dev/null
-    [ -s "$CANDIDATE_FILES" ] && sort -u "$CANDIDATE_FILES" -o "$CANDIDATE_FILES"
+    [ -s "$CANDIDATE_FILES" ] && sort -z -u "$CANDIDATE_FILES" -o "$CANDIDATE_FILES"
     local total
-    total=$(wc -l <"$CANDIDATE_FILES" | tr -d ' ')
+    total=$(tr -cd '\0' <"$CANDIDATE_FILES" | wc -c | tr -d ' ')
     if [ "$total" -eq 0 ]; then
         warn "No candidate files found in the supplied paths."
         return
     fi
     ok "Candidate files: ${W}${total}${NC}  (mode: $( [ "$ALL_MODE" -eq 1 ] && echo all || echo extensions ))"
     local current=0
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
         [ -z "$f" ] && continue
         current=$((current + 1))
         draw_progress "$current" "$total" "Scanning"
@@ -1720,15 +1936,6 @@ print_summary() {
         done <"$INTEREST_FILE"
     fi
 
-    if [ -s "$EXACT_FILE" ]; then
-        print_section_header "Credential-named files (exact match)"
-        local f
-        while IFS= read -r f; do
-            printf '  %b[CRED_FILE]%b %s\n' "$R" "$NC" "$f"
-            log_line "[CRED_FILE] $f"
-        done <"$EXACT_FILE"
-    fi
-
     if [ -s "$NAME_FILE" ]; then
         print_section_header "Suspicious filenames (substring match)"
         local f
@@ -1764,12 +1971,11 @@ print_summary() {
     fi
 
     # Counts
-    local n_guar n_high n_key n_int n_exact n_name n_check n_skip
+    local n_guar n_high n_key n_int n_name n_check n_skip
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && wc -l <"$GUARANTEED_FILE" | tr -d ' ' || echo 0)
     n_high=$( [ -s "$HIGH_FILE" ]    && wc -l <"$HIGH_FILE"    | tr -d ' ' || echo 0)
     n_key=$(  [ -s "$KEY_FILE" ]     && wc -l <"$KEY_FILE"     | tr -d ' ' || echo 0)
     n_int=$(  [ -s "$INTEREST_FILE" ]&& wc -l <"$INTEREST_FILE"| tr -d ' ' || echo 0)
-    n_exact=$([ -s "$EXACT_FILE" ]   && wc -l <"$EXACT_FILE"   | tr -d ' ' || echo 0)
     n_name=$( [ -s "$NAME_FILE" ]    && wc -l <"$NAME_FILE"    | tr -d ' ' || echo 0)
     n_check=$([ -s "$CHECKED_FILE" ] && wc -l <"$CHECKED_FILE" | tr -d ' ' || echo 0)
     n_skip=$( [ -s "$SKIPPED_FILE" ] && wc -l <"$SKIPPED_FILE" | tr -d ' ' || echo 0)
@@ -1781,7 +1987,6 @@ print_summary() {
     printf '  %b%-44s %5d%b\n' "$R" "Reusable credentials"                "$n_high"  "$NC"
     printf '  %b%-44s %5d%b\n' "$M" "Private keys / auth material"        "$n_key"   "$NC"
     printf '  %b%-44s %5d%b\n' "$C" "Auxiliary credential-related files"  "$n_int"   "$NC"
-    printf '  %b%-44s %5d%b\n' "$R" "Credential-named files (exact)"      "$n_exact" "$NC"
     printf '  %b%-44s %5d%b\n' "$Y" "Suspicious filenames (substring)"    "$n_name"  "$NC"
     printf '  %b%-44s %5d%b\n' "$B" "OS locations checked"                "$n_check" "$NC"
     printf '  %b%-44s %5d%b\n' "$D" "Files skipped (size/binary/perm)"    "$n_skip"  "$NC"
@@ -1793,7 +1998,6 @@ print_summary() {
     log_line "  Reusable credentials:            $n_high"
     log_line "  Private keys / material:         $n_key"
     log_line "  Auxiliary credential-related:    $n_int"
-    log_line "  Credential-named files (exact):  $n_exact"
     log_line "  Suspicious filenames (substring):$n_name"
     log_line "  OS locations checked:            $n_check"
     log_line "  Files skipped:                   $n_skip"
@@ -1863,8 +2067,7 @@ main() {
 
     print_summary
 
-    if [ -s "$GUARANTEED_FILE" ] || [ -s "$HIGH_FILE" ] || \
-       [ -s "$KEY_FILE" ]       || [ -s "$EXACT_FILE" ]; then
+    if [ -s "$GUARANTEED_FILE" ] || [ -s "$HIGH_FILE" ] || [ -s "$KEY_FILE" ]; then
         exit 1
     fi
     exit 0
