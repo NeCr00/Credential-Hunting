@@ -62,6 +62,17 @@
 .PARAMETER NoColor
     Strip ANSI colour codes.
 
+.PARAMETER IncludeData
+    Opt-in: also content-scan large data / SQL files in stage 5
+    (.sql/.ddl/.dump/.psql/.pgsql/.plsql/.tsql/.csv/.tsv). These follow the
+    normal -MaxFileSizeMB size cap. Off by default because such files are
+    routinely huge and rarely hold hardcoded credentials.
+
+.PARAMETER NoDefaultExclude
+    Disable the built-in system / vendor directory excludes (Windows Defender,
+    SDKs, Visual Studio, driver vendors, upgrade-staging dirs, etc.) that keep a
+    C:\ scan fast. Stage 1's targeted OS checks are unaffected either way.
+
 .EXAMPLE
     .\credshunter.ps1 -Path C:\Users, C:\inetpub -OutputFile loot.txt
 
@@ -85,6 +96,11 @@ param(
 
     [switch] $All,
 
+    [switch] $IncludeData,   # opt-in: re-enable scanning of large data/SQL files
+                             # (.sql/.ddl/.dump/.psql/.pgsql/.plsql/.tsql/.csv/.tsv)
+
+    [switch] $NoDefaultExclude,   # disable the built-in system/vendor path excludes
+
     [ValidateRange(1, 10240)]
     [int] $MaxFileSizeMB = 5,
 
@@ -107,14 +123,44 @@ param(
     [switch] $Help
 )
 
-if ($Help) {
-    if ($PSCommandPath) { Get-Help $PSCommandPath -Full } else { Get-Help $MyInvocation.MyCommand.Path -Full }
+$script:Version = '2.3.0'
+
+# Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
+# run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
+# comment-based reference.)
+function Show-Usage {
+    @"
+credshunter v$($script:Version) - reusable-credential discovery (read-only, Windows)
+
+Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
+
+  -Path <dir>          Directories to scan (stages 2-5)
+  -ExcludePath <dir>   Directories to skip (stages 2-5)
+  -NoDefaultExclude    Don't skip built-in system / vendor dirs
+  -All                 Stage 5 scans every readable file
+  -IncludeData         Also scan large SQL / CSV / data files
+  -MaxFileSizeMB <n>   Skip files larger than n MB (default 5)
+  -NoSizeLimit         Disable the file-size cap
+  -OutputFile <file>   Append a findings log
+  -SkipSystem          Skip stage 1 (OS checks); alias -NoStage1
+  -NoStage1..5         Skip an individual stage
+  -Quiet               Reduce status noise
+  -NoColor             Strip colour codes
+  -Help                Show this help (-h)
+
+Examples:
+  .\credshunter.ps1 -Path C:\ -OutputFile loot.txt
+  .\credshunter.ps1 -Path C:\Users,C:\inetpub -SkipSystem
+"@
+}
+
+if ($Help -or $PSBoundParameters.Count -eq 0) {
+    Show-Usage
     exit 0
 }
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'Continue'
-$script:Version        = '2.3.0'
 
 # Stage-skip booleans: -SkipSystem is the legacy alias for -NoStage1.
 $script:Stage1Skip = $SkipSystem.IsPresent -or $NoStage1.IsPresent
@@ -707,54 +753,58 @@ $script:Stage4NameTokens = @(
 $script:Stage5Extensions = @(
     '.conf','.config','.cfg','.cnf','.ini','.env','.envrc'
     '.yaml','.yml','.toml','.json','.jsonc','.json5'
-    '.xml','.plist'
+    '.xml'
     '.properties','.prop','.props','.settings'
     '.tf','.tfvars','.tfstate','.hcl'
     '.sh','.bash','.zsh','.ksh','.csh','.fish','.bashrc','.profile','.zshrc'
-    '.ps1','.psm1','.psd1','.ps1xml'
-    '.bat','.cmd','.vbs','.vbe','.wsh','.wsf','.ahk'
+    '.ps1','.psm1','.psd1'
+    '.bat','.cmd','.vbs','.vbe','.wsf','.ahk'
     '.py','.pl','.rb','.php','.phtml','.php3','.php5','.inc'
-    '.lua','.groovy','.tcl','.coffee'
-    '.java','.cs','.vb','.go','.rs','.c','.cpp','.h','.hpp'
+    '.lua','.groovy','.tcl'
+    '.java','.cs','.vb','.go','.rs'
     '.js','.ts','.jsx','.tsx','.mjs','.cjs'
     '.aspx','.asp','.ashx','.asmx','.asax','.ascx','.cshtml','.vbhtml','.master','.svc'
     '.jsp','.jspx','.jspf','.cfm','.cfc'
-    '.htm','.html','.htaccess'
-    '.sql','.ddl','.dump','.dsn','.udl','.ora','.tns'
-    '.reg','.pol','.rdp','.rdg','.rdcman','.inf','.unattend','.answerfile'
+    '.htaccess'
+    '.dsn','.udl','.ora','.tns'
+    '.reg','.rdp','.rdg','.rdcman','.inf','.unattend','.answerfile'
     '.ovpn','.openvpn','.vnc','.rdc','.tcc','.ica','.session','.kix'
-    '.txt','.text','.md','.markdown','.rtf','.nfo','.log','.logs','.readme'
-    '.bak','.backup','.old','.orig','.original','.save','.saved','.tmp','.temp','.cache'
-    '.csv','.tsv','.ldif','.ldiff'
-    '.service','.unit','.timer','.socket','.crontab','.cron'
-    '.local','.shared','.template','.example','.sample','.dist'
+    '.txt','.text','.log','.logs'
+    '.bak','.backup','.old','.orig','.original','.save','.saved','.tmp','.temp'
+    '.ldif','.ldiff'
+    '.service','.unit','.crontab','.cron'
+    '.local','.shared'
     # Secret-bearing / auth file extensions
     '.secret','.secrets','.creds','.cred','.passwd','.auth','.vault'
     # Config management / IaC / templating (Ansible/Puppet/Salt/Chef)
-    '.j2','.erb','.pp','.sls','.tmpl','.tpl','.gotmpl','.nix','.dhall','.jsonnet','.libsonnet','.cson','.bicep'
+    '.j2','.erb','.pp','.sls','.tmpl','.tpl','.gotmpl','.bicep'
     # Additional source languages
-    '.pyw','.kt','.kts','.scala','.sbt','.gradle','.clj','.cljs','.cljc','.edn','.ex','.exs','.erl','.hrl','.dart','.swift'
-    '.vue','.svelte','.astro','.cc','.cxx','.hxx','.hh','.cgi','.fcgi','.php4','.php7','.phps','.pht'
+    '.pyw','.kt','.kts','.scala','.sbt','.gradle','.clj','.cljs','.cljc','.ex','.exs','.erl','.hrl','.dart','.swift'
+    '.vue','.svelte','.astro','.cgi','.fcgi','.php4','.php7','.phps','.pht'
     # .NET / Visual Studio project & publish files (conn strings, deploy creds)
-    '.csproj','.vbproj','.fsproj','.vcxproj','.sln','.resx','.resw','.pubxml','.publishsettings','.manifest'
+    '.resx','.resw','.pubxml','.publishsettings'
     # Windows scripting / app / shortcut formats
-    '.hta','.au3','.url','.psc1','.pssc','.desktop'
+    '.hta','.au3','.url'
     # VPN / network configuration
-    '.nmconnection','.network','.netdev','.link','.wg','.pcf','.mobileconfig'
+    '.nmconnection','.wg','.pcf','.mobileconfig'
     # Database scripts / ORM schemas
-    '.psql','.pgsql','.plsql','.tsql','.cql','.sqlproj','.prisma'
+    '.cql','.prisma'
     # Notes / documentation / mail
-    '.org','.rst','.adoc','.asciidoc','.note','.notes','.wiki','.eml'
+    '.note','.notes','.eml'
     # Backup / package-manager config remnants (old configs keep old creds)
     '.dpkg-old','.dpkg-dist','.dpkg-new','.rpmsave','.rpmnew','.rpmorig','.ucf-old','.ucf-dist'
-    '.bk','.bkp','.bkup','.sav','.swp','.swo','.default'
-    # systemd unit types
-    '.path','.mount','.automount','.target','.slice','.scope'
-    # Tabular / structured data exports
-    '.tab','.psv','.jsonl','.ndjson'
+    '.bk','.bkp','.bkup','.sav','.default'
 )
 $script:Stage5ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage5Extensions, [System.StringComparer]::OrdinalIgnoreCase)
+# -IncludeData re-enables the heavy data/SQL extensions that are off by default
+# (large files, near-zero hardcoded-credential yield). They follow the normal
+# size cap; only .log/.logs get the always-on cap applied at Stage 5 selection.
+if ($IncludeData) {
+    foreach ($e in '.sql','.ddl','.dump','.psql','.pgsql','.plsql','.tsql','.csv','.tsv') {
+        [void]$script:Stage5ExtensionsSet.Add($e)
+    }
+}
 
 # O(1) extension lookups for Stage 2 / Stage 3 (replaces per-file `-contains`
 # linear array scans across the whole tree), and globs pre-lowered once so the
@@ -831,7 +881,7 @@ $script:ExtraScanNames = [System.Collections.Generic.HashSet[string]]::new(
 
 # Exclude these directory names anywhere in the tree
 $script:ExcludeDirNames = @(
-    '.git','.hg','.svn','.bzr','CVS','_darcs'
+    '.hg','.svn','.bzr','CVS','_darcs'
     'node_modules','.npm','.pnpm-store','.yarn','.yarn-cache','.bun'
     '.venv','venv','env','.pyenv','.virtualenvs','__pycache__'
     '.mypy_cache','.pytest_cache','.tox','.nox','.ruff_cache'
@@ -881,8 +931,73 @@ $script:ExcludePathPrefixes = @(
     (Join-Path $env:ProgramData 'Microsoft\IdentityCRL')
     (Join-Path $env:ProgramData 'Microsoft\Device Stage')
     (Join-Path $env:ProgramData 'Microsoft\NetFramework\BreadcrumbStore')
-    (Join-Path $env:ProgramData 'Microsoft\EdgeUpdate\Log')
+    (Join-Path $env:ProgramData 'Vmware')
+    (Join-Path $env:ProgramData 'Microsoft\')
 ) | Where-Object { $_ -and $_.Trim() -ne '' }
+
+# Well-known system / vendor directories that never hold hardcoded credentials.
+# Excluded from the shared stage 2-5 walk by default to keep a C:\ scan fast.
+# Stage 1's targeted OS checks use hardcoded paths and bypass this list, so
+# Jenkins / Tomcat / IIS / SAM / GPP / etc. detection is unaffected. These are
+# directories OUTSIDE C:\Windows (which $env:SystemRoot already excludes).
+# Disable the whole set with -NoDefaultExclude.
+$script:DefaultSystemExcludePrefixes = @(
+    foreach ($pf in @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if (-not $pf) { continue }
+        Join-Path $pf 'Windows Defender'
+        Join-Path $pf 'Windows Defender Advanced Threat Protection'
+        Join-Path $pf 'Windows Kits'                      # Windows SDK headers (.h monster)
+        Join-Path $pf 'Microsoft SDKs'
+        Join-Path $pf 'Microsoft Visual Studio'           # IDE install; user projects live elsewhere
+        Join-Path $pf 'dotnet'
+        Join-Path $pf 'MSBuild'
+        Join-Path $pf 'Reference Assemblies'
+        Join-Path $pf 'Microsoft Office'
+        Join-Path $pf 'Common Files\Microsoft Shared'
+        Join-Path $pf 'NVIDIA Corporation'
+        Join-Path $pf 'Intel'
+        Join-Path $pf 'AMD'
+        Join-Path $pf 'Realtek'
+        Join-Path $pf 'Windows Photo Viewer'
+        Join-Path $pf 'Windows Media Player'
+        Join-Path $pf 'Windows NT'
+        Join-Path $pf 'Windows Mail'
+        Join-Path $pf 'dotnet'
+        Join-Path $pf 'VMware'
+        Join-Path $pf 'Amazon'
+        Join-Path $pf 'AWS Tools'      
+        Join-Path $pf 'AWS SDK for .NET'
+        Join-Path $pf 'AWS Tools for Windows PowerShell'
+        Join-Path $pf 'WindowsPowerShell\Modules'
+        Join-Path $pf 'Windows Defender Advanced Threat Protection'
+        Join-Path $pf 'Reference Assemblies'
+        Join-Path $pf 'Microsoft.NET'
+        
+    }
+    Join-Path $env:ProgramData 'Microsoft'
+    Join-Path $env:ProgramData 'Amazon'
+    Join-Path $env:ProgramData 'Vmware'
+    Join-Path $env:ProgramData 'Package Cache'                     # VS / installer MSI cache
+    Join-Path $env:ProgramData 'NVIDIA'
+    Join-Path $env:ProgramData 'NVIDIA Corporation'
+    Join-Path $env:ProgramData 'Intel'
+    Join-Path $env:SystemDrive 'MSOCache'
+    Join-Path $env:SystemDrive 'Recovery'
+    Join-Path $env:SystemDrive 'Config.Msi'
+    Join-Path $env:SystemDrive '$WinREAgent'
+    Join-Path $env:SystemDrive '$SysReset'
+    Join-Path $env:SystemDrive '$GetCurrent'
+    Join-Path $env:SystemDrive '$Windows.~BT'                      # upgrade staging
+    Join-Path $env:SystemDrive '$Windows.~WS'
+    Join-Path $env:SystemDrive 'OneDriveTemp'
+    Join-Path $env:SystemDrive 'Intel'
+    Join-Path $env:SystemDrive 'AMD'
+    Join-Path $env:SystemDrive 'NVIDIA'
+) | Where-Object { $_ -and $_.Trim() -ne '' }
+
+if (-not $NoDefaultExclude) {
+    $script:ExcludePathPrefixes = @($script:ExcludePathPrefixes) + $script:DefaultSystemExcludePrefixes
+}
 
 # Path-substring exclusions -- used when the noisy directory lives at a
 # per-user path that can't be expressed as a single absolute prefix
@@ -1040,11 +1155,13 @@ function End-Stage { param([int]$N, [string]$Title)
         if ($dHigh -gt 0) {
             $script:HighFindings | Select-Object -Last $dHigh | ForEach-Object {
                 Write-Host ("  [{0,-9}]  {1}" -f 'HIGH', $_.Path)
+                if ($_.Preview) { Write-Host ("             $($script:CD){0}$($script:CNC)" -f $_.Preview) }
             }
         }
         if ($dKey -gt 0) {
             $script:KeyFindings | Select-Object -Last $dKey | ForEach-Object {
                 Write-Host ("  [{0,-9}]  {1}" -f 'KEY', $_.Path)
+                if ($_.Preview) { Write-Host ("             $($script:CD){0}$($script:CNC)" -f $_.Preview) }
             }
         }
         if ($dInt -gt 0) {
@@ -1082,44 +1199,55 @@ function Get-FileSizeSafe { param([string]$FullPath)
 # This replaces the old NUL-means-binary test, which wrongly skipped UTF-16 .reg
 # exports, Scheduled-Task XML, and any Unicode-saved config/log.
 function Read-TextFileSmart {
-    # Returns decoded text, or $null if the file looks binary.
+    # Returns decoded text, or $null if the file looks binary. Opens the file ONCE:
+    # probes the first ProbeBytes for a BOM / UTF-16/32 NUL-stride, rejects genuine
+    # binaries WITHOUT reading the body, then seeks back and streams the rest.
     param([string]$FullPath, [int]$ProbeBytes = 4096)
+    $fs = $null
     try {
-        $fs = [System.IO.File]::OpenRead($FullPath)
-        try {
-            $buf = New-Object byte[] $ProbeBytes
-            $read = $fs.Read($buf, 0, $buf.Length)
-            if ($read -le 0) { return $null }
-            $enc = $null
-            if ($read -ge 3 -and $buf[0] -eq 0xEF -and $buf[1] -eq 0xBB -and $buf[2] -eq 0xBF) {
+        # Read-only, share ReadWrite so we never lock a log that's being appended to.
+        $fs    = [System.IO.File]::Open($FullPath, 'Open', 'Read', 'ReadWrite')
+        $probe = New-Object byte[] $ProbeBytes
+        $read  = $fs.Read($probe, 0, $probe.Length)
+        if ($read -le 0) { $fs.Dispose(); return '' }
+
+        $enc = $null
+        if ($read -ge 3 -and $probe[0] -eq 0xEF -and $probe[1] -eq 0xBB -and $probe[2] -eq 0xBF) {
+            $enc = [System.Text.Encoding]::UTF8
+        } elseif ($read -ge 4 -and $probe[0] -eq 0xFF -and $probe[1] -eq 0xFE -and $probe[2] -eq 0 -and $probe[3] -eq 0) {
+            $enc = [System.Text.Encoding]::UTF32
+        } elseif ($read -ge 4 -and $probe[0] -eq 0 -and $probe[1] -eq 0 -and $probe[2] -eq 0xFE -and $probe[3] -eq 0xFF) {
+            $enc = New-Object System.Text.UTF32Encoding($true, $true)
+        } elseif ($read -ge 2 -and $probe[0] -eq 0xFF -and $probe[1] -eq 0xFE) {
+            $enc = [System.Text.Encoding]::Unicode
+        } elseif ($read -ge 2 -and $probe[0] -eq 0xFE -and $probe[1] -eq 0xFF) {
+            $enc = [System.Text.Encoding]::BigEndianUnicode
+        }
+        if (-not $enc) {
+            $nul = 0; $nulEven = 0; $nulOdd = 0
+            for ($i = 0; $i -lt $read; $i++) {
+                if ($probe[$i] -eq 0) { $nul++; if ($i % 2) { $nulOdd++ } else { $nulEven++ } }
+            }
+            if ($nul -eq 0) {
                 $enc = [System.Text.Encoding]::UTF8
-            } elseif ($read -ge 4 -and $buf[0] -eq 0xFF -and $buf[1] -eq 0xFE -and $buf[2] -eq 0 -and $buf[3] -eq 0) {
-                $enc = [System.Text.Encoding]::UTF32
-            } elseif ($read -ge 4 -and $buf[0] -eq 0 -and $buf[1] -eq 0 -and $buf[2] -eq 0xFE -and $buf[3] -eq 0xFF) {
-                $enc = New-Object System.Text.UTF32Encoding($true, $true)
-            } elseif ($read -ge 2 -and $buf[0] -eq 0xFF -and $buf[1] -eq 0xFE) {
+            } elseif ($nulOdd -ge ($read / 4) -and $nulEven -lt ($read / 16)) {
                 $enc = [System.Text.Encoding]::Unicode
-            } elseif ($read -ge 2 -and $buf[0] -eq 0xFE -and $buf[1] -eq 0xFF) {
+            } elseif ($nulEven -ge ($read / 4) -and $nulOdd -lt ($read / 16)) {
                 $enc = [System.Text.Encoding]::BigEndianUnicode
+            } else {
+                $fs.Dispose(); return $null   # genuine binary -- reject without reading the body
             }
-            if (-not $enc) {
-                $nul = 0; $nulEven = 0; $nulOdd = 0
-                for ($i = 0; $i -lt $read; $i++) {
-                    if ($buf[$i] -eq 0) { $nul++; if ($i % 2) { $nulOdd++ } else { $nulEven++ } }
-                }
-                if ($nul -eq 0) {
-                    $enc = [System.Text.Encoding]::UTF8
-                } elseif ($nulOdd -ge ($read / 4) -and $nulEven -lt ($read / 16)) {
-                    $enc = [System.Text.Encoding]::Unicode
-                } elseif ($nulEven -ge ($read / 4) -and $nulOdd -lt ($read / 16)) {
-                    $enc = [System.Text.Encoding]::BigEndianUnicode
-                } else {
-                    return $null
-                }
-            }
-        } finally { $fs.Dispose() }
-        return [System.IO.File]::ReadAllText($FullPath, $enc)
-    } catch { return $null }
+        }
+
+        $fs.Position = 0
+        $sr = New-Object System.IO.StreamReader($fs, $enc, $true)  # takes ownership of $fs
+        $fs = $null                                                # prevent double-dispose
+        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+    } catch {
+        return $null
+    } finally {
+        if ($fs) { try { $fs.Dispose() } catch {} }
+    }
 }
 
 function Test-DirectoryExcluded { param([string]$DirectoryPath)
@@ -1256,7 +1384,7 @@ function Add-Skipped { param([string]$Path, [string]$Reason)
 #   4. First pattern that matches a line wins (one finding per line).
 #   5. Skip pathologically long lines (> MaxLineLen, 16 KB) -- minified JS,
 #      base64 blobs, or log rotations, never credential assignments.
-function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'content')
+function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'content', [long]$KnownSize = -1)
     if ($script:SelfPath -and $FullPath -eq $script:SelfPath) { return }
     if (-not $script:ScannedPaths.Add($FullPath)) { return }
 
@@ -1288,7 +1416,10 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     # we skip their content to avoid <YOUR_PASSWORD>-style false positives.
     if ($bn -match '\.env\.(example|sample|template|dist)$') { Add-Skipped -Path $FullPath -Reason 'env template'; return }
 
-    $size = Get-FileSizeSafe -FullPath $FullPath
+    # Reuse the size Stage 5 already captured from directory find-data (passed via
+    # -KnownSize) instead of forcing a second stat. Stage 1 call sites omit it and
+    # fall back to Get-FileSizeSafe.
+    $size = if ($KnownSize -ge 0) { $KnownSize } else { Get-FileSizeSafe -FullPath $FullPath }
     if ($size -lt 0) { Add-Skipped -Path $FullPath -Reason 'unreadable'; return }
     if ($size -eq 0) { return }
     # Hard memory ceiling enforced even under -NoSizeLimit: never read a file
@@ -1306,12 +1437,21 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     if ($null -eq $content) { Add-Skipped -Path $FullPath -Reason 'binary'; return }
     if ([string]::IsNullOrEmpty($content)) { return }
 
-    # ---- Always-on: private-key markers (very fast, format-anchored) --------
-    foreach ($p in $script:KeyPatterns) {
-        $m = $p.Regex.Match($content)
-        if ($m.Success) {
-            $lineNo = Get-LineNumber -Content $content -Index $m.Index
-            Add-Finding -Bucket Key -Label $p.Label -Path $FullPath -LineNumber $lineNo -Preview $m.Value
+    # ---- Private-key markers (format-anchored) ------------------------------
+    # ~99% of files contain no key header, so gate the 8 whole-file regex passes
+    # behind a cheap Ordinal substring check. This canNOT run after the keyword
+    # prefilter: key headers (-----BEGIN ... / PuTTY-User-Key-File-) match no
+    # prefilter anchor, so prefiltering would drop real keys. These two literals
+    # cover every $script:KeyPatternsRaw entry (all 7 PEM "-----BEGIN ..." markers
+    # plus the PuTTY marker).
+    if ($content.IndexOf('-----BEGIN', [System.StringComparison]::Ordinal) -ge 0 -or
+        $content.IndexOf('PuTTY-User-Key-File', [System.StringComparison]::Ordinal) -ge 0) {
+        foreach ($p in $script:KeyPatterns) {
+            $m = $p.Regex.Match($content)
+            if ($m.Success) {
+                $lineNo = Get-LineNumber -Content $content -Index $m.Index
+                Add-Finding -Bucket Key -Label $p.Label -Path $FullPath -LineNumber $lineNo -Preview $m.Value
+            }
         }
     }
 
@@ -1337,15 +1477,22 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
 
     # ---- Line-by-line credential-pattern scan -------------------------------
     $matchesFound = 0
-    $lines = $content -split '(?:\r\n|\r|\n)'
-    for ($i = 0; $i -lt $lines.Length; $i++) {
-        if ($matchesFound -ge $script:MaxMatchesPerFile) { break }
-        $line = $lines[$i]
-        $llen = $line.Length
-        if ($llen -lt 6 -or $llen -gt $script:MaxLineLen) { continue }
+    # Stream lines with a StringReader instead of -split, which would allocate the
+    # whole file as a string[] -- doubling memory and GC pressure on exactly the
+    # large files that are slowest. $i is 1-based (incremented before use), so
+    # findings use -LineNumber $i. StringReader.ReadLine() treats \r\n, \r and \n
+    # as terminators, matching the old split semantics.
+    $reader = New-Object System.IO.StringReader($content)
+    try {
+        $i = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $i++
+            if ($matchesFound -ge $script:MaxMatchesPerFile) { break }
+            $llen = $line.Length
+            if ($llen -lt 6 -or $llen -gt $script:MaxLineLen) { continue }
 
-        # Cheap per-line keyword check (regex IsMatch on a short string is fast)
-        if (-not $script:KeywordPrefilter.IsMatch($line)) { continue }
+            # Cheap per-line keyword check (regex IsMatch on a short string is fast)
+            if (-not $script:KeywordPrefilter.IsMatch($line)) { continue }
 
         foreach ($p in $script:CredPatterns) {
             $m = $p.Regex.Match($line)
@@ -1424,11 +1571,12 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             }
 
             Add-Finding -Bucket High -Label "$SourceLabel/$($p.Label)" `
-                -Path $FullPath -LineNumber ($i + 1) -Preview (Format-Preview $line)
+                -Path $FullPath -LineNumber $i -Preview (Format-Preview $line)
             $matchesFound++
             break    # one classification per line is enough
         }
-    }
+        }
+    } finally { $reader.Dispose() }
 }
 
 function Test-KnownFile { param([string]$Path, [string]$Label)
@@ -2235,15 +2383,15 @@ function Invoke-SystemChecks {
 #  Recursive scanning of user-supplied paths (stages 2-5)
 # ============================================================================
 
-# Single tree walk per stage with the directory-exclusion check applied.
+# Single shared tree walk for stages 2-5, with the directory-exclusion check applied.
 function Get-WalkedFiles { param([string[]]$Paths)
     # Walk each -Path subtree ONCE (reparse-guarded, Test-DirectoryExcluded
     # applied) and return a List of file descriptors { Path, Name (lc), Ext (lc),
     # Size } that stages 2-5 share, instead of each stage re-walking the tree.
     # No size filtering here -- stages 2-4 never read content; Stage 5 applies the
-    # size cap itself when it selects candidates. DirectoryInfo.EnumerateFiles
-    # yields FileInfo whose .Length comes from the directory find-data (no extra
-    # stat), so Size is populated essentially for free.
+    # size cap itself when it selects candidates. One EnumerateFileSystemInfos pass
+    # yields files AND subdirectories together; the FileInfo .Length comes from the
+    # directory find-data (no extra stat), so Size is populated essentially for free.
     $result = [System.Collections.Generic.List[object]]::new()
     $stack  = [System.Collections.Generic.Stack[string]]::new()
     foreach ($r in $Paths) {
@@ -2267,21 +2415,22 @@ function Get-WalkedFiles { param([string[]]$Paths)
         }
         $stack.Push($abs)
     }
+    $walkCount = 0
     while ($stack.Count -gt 0) {
         $current = $stack.Pop()
         try {
-            foreach ($fi in (New-Object System.IO.DirectoryInfo $current).EnumerateFiles()) {
-                try {
+            foreach ($info in (New-Object System.IO.DirectoryInfo $current).EnumerateFileSystemInfos()) {
+                if ($info -is [System.IO.DirectoryInfo]) {
+                    if (-not (Test-DirectoryExcluded -DirectoryPath $info.FullName)) { $stack.Push($info.FullName) }
+                } else {
                     $result.Add([PSCustomObject]@{
-                        Path = $fi.FullName; Name = $fi.Name.ToLowerInvariant()
-                        Ext  = $fi.Extension.ToLowerInvariant(); Size = $fi.Length })
-                } catch {}
-            }
-        } catch {}
-        try {
-            foreach ($di in (New-Object System.IO.DirectoryInfo $current).EnumerateDirectories()) {
-                if (Test-DirectoryExcluded -DirectoryPath $di.FullName) { continue }
-                $stack.Push($di.FullName)
+                        Path = $info.FullName; Name = $info.Name.ToLowerInvariant()
+                        Ext  = $info.Extension.ToLowerInvariant(); Size = $info.Length })
+                    $walkCount++
+                    if (-not $Quiet -and ($walkCount % 20000) -eq 0) {
+                        Write-Host ("  $($script:CD)[*] enumerated $walkCount files...$($script:CNC)")
+                    }
+                }
             }
         } catch {}
     }
@@ -2366,7 +2515,9 @@ function Invoke-UserPathScan { param($Files)
     }
     Write-Info "Enumerating candidate files..."
     $allMode = $All.IsPresent
-    $cands = [System.Collections.Generic.List[string]]::new()
+    # Keep the descriptor objects (not bare paths) so the size captured during the
+    # walk can be threaded into Invoke-ScanFile, avoiding a second per-file stat.
+    $cands = [System.Collections.Generic.List[object]]::new()
     foreach ($d in $Files) {
         $include = $false
         if ($allMode) {
@@ -2385,9 +2536,16 @@ function Invoke-UserPathScan { param($Files)
             $include = $true
         }
         if (-not $include) { continue }
+        # .log / .logs are kept in the content scan (admins sometimes paste passwords,
+        # connection strings, or tokens into custom logs) but are ALWAYS bounded by the
+        # MaxFileSizeMB cap -- even under -NoSizeLimit and -All -- because verbose/rotating
+        # logs are the known size-blowup vector for Stage 5. Raise -MaxFileSizeMB to scan
+        # larger logs (this guard tracks $script:MaxFileSizeBytes).
+        if (($d.Ext -eq '.log' -or $d.Ext -eq '.logs') -and
+            ($d.Size -lt 0 -or $d.Size -gt $script:MaxFileSizeBytes)) { continue }
         # Size cap at Stage-5 selection time (Size < 0 = stat failed -> exclude).
         if ($script:SkipLarge -and ($d.Size -lt 0 -or $d.Size -gt $script:MaxFileSizeBytes)) { continue }
-        $cands.Add($d.Path)
+        $cands.Add($d)
     }
     $total = $cands.Count
     if ($total -eq 0) {
@@ -2402,14 +2560,14 @@ function Invoke-UserPathScan { param($Files)
         # Throttled progress. Truncate long paths so the progress bar doesn't
         # blow out terminal width with deep SQL Server / WindowsApps paths.
         if (($i % 25) -eq 0 -or $i -eq $total) {
-            $cur = $f
+            $cur = $f.Path
             if ($cur.Length -gt 70) { $cur = '...' + $cur.Substring($cur.Length - 67) }
             Write-Progress -Activity "Scanning files for credentials" `
                            -Status ("{0} / {1}" -f $i, $total) `
                            -CurrentOperation $cur `
                            -PercentComplete ([Math]::Min(100, ($i * 100 / $total)))
         }
-        Invoke-ScanFile -FullPath $f -SourceLabel 'content'
+        Invoke-ScanFile -FullPath $f.Path -SourceLabel 'content' -KnownSize $f.Size
     }
     Write-Progress -Activity "Scanning files for credentials" -Completed
 }
@@ -2435,6 +2593,7 @@ function Write-FindingsSection {
 function Write-FullSummary {
     Write-Section "Findings"
 
+    try {
     if ($script:Guaranteed.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)> Confirmed credential containers  !$($script:CNC)"
@@ -2445,10 +2604,14 @@ function Write-FullSummary {
             Write-LogLine ("[CRITICAL] $($g.Extension)  $($g.Path)")
         }
     }
+    } catch { Write-Warn ("summary section error (Confirmed credential containers): " + $_.Exception.Message) }
 
-    Write-FindingsSection -Title "Reusable credentials" -List $script:HighFindings -Tag "HIGH" -Color $script:CR
-    Write-FindingsSection -Title "Private keys & authentication material" -List $script:KeyFindings -Tag "KEY" -Color $script:CM
+    try { Write-FindingsSection -Title "Reusable credentials" -List $script:HighFindings -Tag "HIGH" -Color $script:CR }
+    catch { Write-Warn ("summary section error (Reusable credentials): " + $_.Exception.Message) }
+    try { Write-FindingsSection -Title "Private keys & authentication material" -List $script:KeyFindings -Tag "KEY" -Color $script:CM }
+    catch { Write-Warn ("summary section error (Private keys): " + $_.Exception.Message) }
 
+    try {
     if ($script:Interesting.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)> Auxiliary credential-related files$($script:CNC)"
@@ -2459,7 +2622,9 @@ function Write-FullSummary {
             Write-LogLine ("[INTEREST] $($i.Category)  $($i.Path)")
         }
     }
+    } catch { Write-Warn ("summary section error (Auxiliary credential-related files): " + $_.Exception.Message) }
 
+    try {
     if ($script:SuspiciousNamesFound.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)> Suspicious filenames (substring match)$($script:CNC)"
@@ -2470,7 +2635,9 @@ function Write-FullSummary {
             Write-LogLine ("[NAME] $n")
         }
     }
+    } catch { Write-Warn ("summary section error (Suspicious filenames): " + $_.Exception.Message) }
 
+    try {
     if ($script:LocationsChecked.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)> OS locations checked$($script:CNC)"
@@ -2481,7 +2648,9 @@ function Write-FullSummary {
             Write-LogLine ("[CHECK] $($c.Label)  $($c.Path)")
         }
     }
+    } catch { Write-Warn ("summary section error (OS locations checked): " + $_.Exception.Message) }
 
+    try {
     if ($script:SkippedFiles.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)> Skipped files$($script:CNC)"
@@ -2492,7 +2661,9 @@ function Write-FullSummary {
             Write-LogLine ("[SKIP] $($s.Reason)  $($s.Path)")
         }
     }
+    } catch { Write-Warn ("summary section error (Skipped files): " + $_.Exception.Message) }
 
+    try {
     Write-Section "Summary"
     $nGuar  = $script:Guaranteed.Count
     $nHigh  = $script:HighFindings.Count
@@ -2522,6 +2693,7 @@ function Write-FullSummary {
     Write-LogLine "  Suspicious filenames (substring):$nName"
     Write-LogLine "  OS locations checked:            $nCheck"
     Write-LogLine "  Files skipped:                   $nSkip"
+    } catch { Write-Warn ("summary section error (Summary table): " + $_.Exception.Message) }
 
     if ($script:LogPath) {
         Write-Host ""
@@ -2573,6 +2745,10 @@ function Invoke-Main {
         }
     }
 
+    # Run all stages inside try/finally so the consolidated summary ALWAYS prints
+    # even if a stage throws -- the exception still propagates to the outer catch
+    # ("Fatal:" + exit 2) afterwards. If nothing throws, behaviour is unchanged.
+    try {
     if (-not $script:Stage1Skip) {
         Begin-Stage 1
         Invoke-SystemChecks
@@ -2613,8 +2789,9 @@ function Invoke-Main {
             Stage-Skipped 5 "Recursive content scan"
         }
     }
-
-    Write-FullSummary
+    } finally {
+        Write-FullSummary
+    }
 
     if ($script:Guaranteed.Count -gt 0 -or
         $script:HighFindings.Count -gt 0 -or
