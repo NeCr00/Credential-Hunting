@@ -1,6 +1,8 @@
+# CredsHunter
 <div align="center">
 
-<img src="assets/banner.svg" alt="credshunter" width="780">
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/19a115de-0fc1-4745-ba61-b3a69994d07a" />
+
 
 <br>
 
