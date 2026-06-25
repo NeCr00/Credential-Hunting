@@ -14,37 +14,47 @@
 
 </div>
 
----
+`credshunter` is a read-only credential finder for authorized post-exploitation. It walks a host once and surfaces the secrets you can actually **reuse** — passwords, keys, hashes, and credential files — while staying quiet on the cloud / SaaS tokens that only add noise.
 
-`credshunter` hunts material a pentester can **reuse** to move laterally or escalate on Linux and Windows: plaintext passwords, DB connection strings, GPP `cpassword`, SSH and PuTTY keys, NTLM / Kerberos / shadow hashes, command-line creds in shell history, KeePass / RDP / WinSCP files, and more. It deliberately ignores cloud and SaaS tokens (AWS, GitHub, Slack, JWTs) — the noise that rarely helps inside a network.
+Two siblings, one behaviour: `credshunter.sh` for Linux, `credshunter.ps1` for Windows.
 
-One Bash script for Linux, one PowerShell script for Windows. **Read-only · no network · no dependencies.**
+## How it works
 
-## Quickstart
+A five-stage funnel, narrowing from *where credentials live* to *what's inside files*. Each stage prints its findings the moment it finishes.
+
+```
+ Stage 1   OS credential stores     registry · GPP · histories · vaults · keys · other
+ Stage 2   Confirmed containers     .kdbx · .ppk · .pfx · .keytab · other
+ Stage 3   High-value file types    keys · .env · backups · DBs · captures · other
+ Stage 4   Suspicious filenames     *password* · *secret* · *credential*
+ Stage 5   Content scan             70+ tuned regexes, one pass per file
+```
+
+Stages 1 and 5 do the heavy lifting; 2–4 are fast filename / extension passes. Every finding clears a false-positive filter before it reaches you.
+
+## Usage
 
 ```bash
-# Linux — sweep / and write a log
+# Linux — full sweep, log to file
 sudo ./credshunter.sh -p / -o loot.txt
+
+# Targeted, skip the slow content scan
+./credshunter.sh -p /var/www -p /home --no-stage5
 ```
 
 ```powershell
 # Windows — elevated sweep of C:\
 .\credshunter.ps1 -Path C:\ -OutputFile loot.txt
+
+# Web / DB box: also scan SQL & CSV dumps
+.\credshunter.ps1 -Path D:\ -IncludeData
 ```
 
-## Pipeline
-
-Five stages. Each streams its findings the moment it finishes.
-
-| # | Stage | Looks for |
-|:-:|---|---|
-| **1** | OS stores | registry · GPP · histories · vaults · keys |
-| **2** | Containers | `.kdbx` `.ppk` `.pfx` `.keytab` … |
-| **3** | High-value | keys · `.env` · backups · DBs · captures |
-| **4** | Filenames | `*password*` · `*secret*` · `*credential*` |
-| **5** | Content | 70+ tuned regexes, one pass per file |
+Pipe-friendly — add `--no-color` / `-NoColor` and grep for a tier.
 
 ## Output
+
+Findings are grouped into five tiers, loudest first.
 
 | Tag | Meaning |
 |---|---|
@@ -54,30 +64,32 @@ Five stages. Each streams its findings the moment it finishes.
 | `[INTEREST]` | High-value file worth a look |
 | `[NAME]` | Suspicious filename — review hint |
 
-```text
-======================================================================
-  Stage 5 -- Recursive content scan
-----------------------------------------------------------------------
-  Found: 3 file(s)   (0.07s)
+The exit code is `1` whenever anything lands in CRITICAL / HIGH / KEY — handy for CI:
+`./credshunter.sh -p /etc && echo clean`.
 
-  [HIGH     ]  /var/www/html/wp-config.php
-  [HIGH     ]  /mnt/sysvol/Policies/.../Groups.xml
-  [KEY      ]  /home/alice/.ssh/id_ed25519
-======================================================================
-```
+## Tuning
 
-## Options
+| Want to… | Do this |
+|---|---|
+| Limit scope | `-p` / `-Path` to include, `-x` / `-ExcludePath` to skip |
+| Scan every file | `-a` / `-All` |
+| Add SQL / CSV dumps | `-IncludeData` *(PowerShell)* |
+| Change the size cap | `-m N` / `-MaxFileSizeMB N`, or `--no-size-limit` / `-NoSizeLimit` |
+| Skip a stage | `--no-stageN` / `-NoStageN` |
 
-| Bash | PowerShell | Effect |
-|---|---|---|
-| `-p PATH` | `-Path PATH` | Scope for stages 2–5 (repeatable) |
-| `-o FILE` | `-OutputFile FILE` | Append a findings log (owner-only) |
-| `-a` | `-All` | Stage 5 scans every readable file |
-| `--no-stageN` | `-NoStageN` | Skip stage N (1–5) |
-| `-q` | `-Quiet` | Reduce status noise |
-| `-h` | `-h` | Help menu |
+Patterns and file-type lists live in clearly-labelled arrays near the top of each script — edit one place, nothing else needed.
 
-Full reference: `-h` / `Get-Help .\credshunter.ps1` 
+## FAQ
+
+**Does it change anything on the host?**
+No. It writes only to the log file you choose, never touches the network, and exits cleanly on Ctrl-C.
+
+**Why ignore AWS / GitHub / Slack tokens?**
+By design — they rarely help with in-network movement and are the top source of false positives. Local cloud-CLI credential *files* are still listed.
+
+**Stage 5 feels slow, or a password was missed.**
+Verbose logs are the usual cost — they're bounded by the size cap. Narrow with `-p`, skip content scanning with `--no-stage5`, and confirm the target isn't over the size cap, in an excluded path, or an extension outside the Stage 5 set (use `-All` to be sure).
+
 
 
 ## Wiki
