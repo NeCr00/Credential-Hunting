@@ -6,8 +6,6 @@
 
 <br>
 
-**Find the credentials you can actually reuse — and none of the noise.**
-
 ![read-only](https://img.shields.io/badge/read--only-yes-3fb950?style=flat-square)
 ![no network](https://img.shields.io/badge/network-none-3fb950?style=flat-square)
 ![bash](https://img.shields.io/badge/bash-4%2B-2b3137?style=flat-square&logo=gnubash&logoColor=white)
@@ -77,10 +75,13 @@ Five stages. Each streams its findings the moment it finishes.
 | `-a` | `-All` | Stage 5 scans every readable file |
 | `--no-stageN` | `-NoStageN` | Skip stage N (1–5) |
 | `-q` | `-Quiet` | Reduce status noise |
+| `-h` | `-h` | Help menu |
 
-Full reference: `-h` / `Get-Help .\credshunter.ps1` · [docs/REFERENCE.md](docs/REFERENCE.md)
-<br>**Exit codes** — `0` clean · `1` finding · `2` argument / IO error · `130` interrupted
+Full reference: `-h` / `Get-Help .\credshunter.ps1` 
 
-## License
 
-For authorized security testing only. No warranty, express or implied.
+## Wiki
+Check out the [Wiki Document](https://github.com/NeCr00/Credential-Hunting/wiki) for more information about the project.
+
+## Contribute
+Feel free to contribute on the project !
