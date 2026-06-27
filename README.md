@@ -36,7 +36,7 @@ Stages 1 and 5 do the heavy lifting; 2–4 are fast filename / extension passes.
 
 ```bash
 # Linux — full sweep, log to file
-sudo ./credshunter.sh -p / -o loot.txt
+./credshunter.sh -p / -o loot.txt
 
 # Targeted, skip the slow content scan
 ./credshunter.sh -p /var/www -p /home --no-stage5
