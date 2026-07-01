@@ -123,7 +123,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.3.0'
+$script:Version = '2.4.0'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -182,7 +182,12 @@ if ([string]::IsNullOrEmpty($script:SelfPath)) {
 $script:MaxFileSizeBytes  = $MaxFileSizeMB * 1MB
 $script:SkipLarge         = -not $NoSizeLimit.IsPresent
 $script:MaxMatchesPerFile = 20
-$script:MaxPreviewLen     = 140
+# Findings output is NEVER truncated -- the full matched secret is always shown
+# in the grouped Findings section and written to the -OutputFile log. The live
+# per-stage feed caps each preview at MaxLivePreviewLen purely so a pathological
+# multi-KB minified / base64 / log line cannot flood the console; any real
+# credential is far shorter and shown whole. Mirrored in the bash engine.
+$script:MaxLivePreviewLen = 2000
 # Longest line scanned per file. 16 KB covers single-line GPP Groups.xml /
 # one-line JSON connection strings while bounding .NET regex backtracking on
 # minified/base64/log lines. Mirrored in the bash engine (MAX_LINE_LEN).
@@ -222,6 +227,40 @@ if ($script:UseColor) {
     $script:CM=''; $script:CC=''; $script:CW=''; $script:CD=''
     $script:CBold=''; $script:CNC=''
 }
+
+# ----------------------------------------------------------------------------
+#  Box-drawing glyphs
+#
+#  Unicode when the console output encoding is UTF-8 (code page 65001), ASCII
+#  fallback otherwise so legacy code pages (1252/437) never render mojibake.
+#  Glyphs are built from [char] code points at RUNTIME so this .ps1 stays pure
+#  ASCII on disk -- Windows PowerShell 5.1 parses it correctly regardless of the
+#  host code page. Mirrored in the bash engine (setup_glyphs).
+# ----------------------------------------------------------------------------
+$script:UseUnicode = $false
+try { if ([Console]::OutputEncoding.CodePage -eq 65001) { $script:UseUnicode = $true } } catch {}
+
+function Set-Glyphs {
+    if ($script:UseUnicode) {
+        $script:GH      = [string][char]0x2500   # horizontal light
+        $script:GHV     = [string][char]0x2550   # horizontal double
+        $script:GTL     = [string][char]0x256D   # rounded corners
+        $script:GTR     = [string][char]0x256E
+        $script:GBL     = [string][char]0x2570
+        $script:GBR     = [string][char]0x256F
+        $script:GBranch = [string][char]0x2514 + [string][char]0x2500
+        $script:GBul    = [string][char]0x25B8   # right-pointing bullet
+        $script:GDot    = [string][char]0x00B7   # middle dot
+        $script:GEll    = [string][char]0x2026   # ellipsis
+        $script:GWarn   = [string][char]0x26A0   # warning sign
+        $script:GArrow  = [string][char]0x2192   # right arrow
+    } else {
+        $script:GH='-'; $script:GHV='='; $script:GTL='+'; $script:GTR='+'
+        $script:GBL='+'; $script:GBR='+'; $script:GBranch='+-'
+        $script:GBul='>'; $script:GDot='-'; $script:GEll='...'; $script:GWarn='!'; $script:GArrow='->'
+    }
+}
+Set-Glyphs
 
 # ----------------------------------------------------------------------------
 #  Finding storage
@@ -768,7 +807,7 @@ $script:Stage5Extensions = @(
     '.htaccess'
     '.dsn','.udl','.ora','.tns'
     '.reg','.rdp','.rdg','.rdcman','.inf','.unattend','.answerfile'
-    '.ovpn','.openvpn','.vnc','.rdc','.tcc','.ica','.session','.kix'
+    '.ovpn','.openvpn','.vnc','.rdc','.tcc','.ica','.session','.script','.kix'
     '.txt','.text','.log','.logs'
     '.bak','.backup','.old','.orig','.original','.save','.saved','.tmp','.temp'
     '.ldif','.ldiff'
@@ -1031,16 +1070,22 @@ if ($script:UserExcludePaths.Count -gt 0) {
 
 function Write-Banner {
     if ($Quiet) { return }
+    $label = ' credshunter '
+    $span  = 62
+    $top = $script:GTL + $script:GH + $label + ($script:GH * ($span - 1 - $label.Length)) + $script:GTR
+    $bot = $script:GBL + ($script:GH * $span) + $script:GBR
     Write-Host ""
-    Write-Host "$($script:CC)$($script:CBold)  +-------------------------------------------------------------+$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  |  credshunter  *  Windows reusable-credential discovery     |$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  |  v$($script:Version)  *  $($script:CD)authorized testing only * read-only$($script:CNC)$($script:CC)$($script:CBold)             |$($script:CNC)"
-    Write-Host "$($script:CC)$($script:CBold)  +-------------------------------------------------------------+$($script:CNC)"
+    Write-Host ("  $($script:CC)$($script:CBold){0}$($script:CNC)" -f $top)
+    Write-Host ("     $($script:CW)reusable-credential discovery $($script:GDot) v$($script:Version) $($script:GDot) Windows$($script:CNC)")
+    Write-Host ("     $($script:CD)authorized testing only $($script:GDot) read-only$($script:CNC)")
+    Write-Host ("  $($script:CC)$($script:CBold){0}$($script:CNC)" -f $bot)
     Write-Host ""
 }
 function Write-Section { param([string]$Title)
+    $tw = 66
+    $fill = $tw - 6 - $Title.Length; if ($fill -lt 3) { $fill = 3 }
     Write-Host ""
-    Write-Host "$($script:CBold)$($script:CC)=== $Title ===$($script:CNC)"
+    Write-Host ("  $($script:CBold)$($script:CC){0} {1} {2}$($script:CNC)" -f ($script:GHV * 2), $Title, ($script:GHV * $fill))
 }
 function Write-Info { param([string]$Msg) if (-not $Quiet) { Write-Host "$($script:CB)[*]$($script:CNC) $Msg" } }
 function Write-Ok   { param([string]$Msg) if (-not $Quiet) { Write-Host "$($script:CG)[+]$($script:CNC) $Msg" } }
@@ -1066,15 +1111,16 @@ function Write-Stage1Finding {
         default    { $color = $script:CR; $tag = $Tier.ToUpper() }
     }
     if ($LineNumber -gt 0) {
-        Write-Host ("{0}   +- [{1}]{2} {3} -> {4}:{5}" -f $color, $tag, $script:CNC, $Label, $Path, $LineNumber)
+        Write-Host ("{0}   {1} [{2}]{3} {4} {5} {6}:{7}" -f $color, $script:GBranch, $tag, $script:CNC, $Label, $script:GArrow, $Path, $LineNumber)
     } else {
-        Write-Host ("{0}   +- [{1}]{2} {3} -> {4}" -f $color, $tag, $script:CNC, $Label, $Path)
+        Write-Host ("{0}   {1} [{2}]{3} {4} {5} {6}" -f $color, $script:GBranch, $tag, $script:CNC, $Label, $script:GArrow, $Path)
     }
     # Show the matched content/command inline (dim) so the operator can verify
     # an embedded credential live -- e.g. a session command holding -pw '...'
-    # that the regex flagged but whose value lives only in the preview.
+    # that the regex flagged but whose value lives only in the preview. Live
+    # feed only: capped (the full value is always in the Findings section / log).
     if ($Preview -ne '' -and $Preview -ne $Path) {
-        Write-Host ("{0}        {1}{2}" -f $script:CD, $Preview, $script:CNC)
+        Write-Host ("{0}        {1}{2}" -f $script:CD, (Format-LivePreview $Preview), $script:CNC)
     }
     $script:SubstageFindings++
 }
@@ -1094,7 +1140,7 @@ function Invoke-Stage1Check {
         Write-Warn ("substage error (continuing): " + $_.Exception.Message)
     }
     if ($script:SubstageFindings -eq 0 -and -not $Quiet) {
-        Write-Host ("{0}   +- no credentials found in this category{1}" -f $script:CD, $script:CNC)
+        Write-Host ("{0}   {1} no credentials found in this category{2}" -f $script:CD, $script:GBranch, $script:CNC)
     }
 }
 
@@ -1136,53 +1182,54 @@ function End-Stage { param([int]$N, [string]$Title)
     $dName = $script:SuspiciousNamesFound.Count - $before.Name
     $total = $dGuar + $dHigh + $dKey + $dInt + $dName
 
+    $header = "Stage $N -- $Title"
+    $tw = 72
+    $fill = $tw - 6 - $header.Length; if ($fill -lt 3) { $fill = 3 }
     Write-Host ""
-    Write-Host "$($script:CC)======================================================================$($script:CNC)"
-    Write-Host "$($script:CBold)  Stage $N -- $Title$($script:CNC)"
-    Write-Host "$($script:CC)----------------------------------------------------------------------$($script:CNC)"
+    Write-Host ("  $($script:CD)$($script:CC){0}$($script:CNC) $($script:CBold){1}$($script:CNC) $($script:CD)$($script:CC){2}$($script:CNC)" -f ($script:GH * 2), $header, ($script:GH * $fill))
     # Invariant culture so the decimal separator is always '.' (matches the
     # bash output) regardless of the host's regional settings.
     $elapsedStr = $elapsed.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
-    Write-Host ("  Found: $($script:CW)$($script:CBold){0}$($script:CNC) file(s)   ({1}s)" -f $total, $elapsedStr)
+    Write-Host ("     $($script:CD){0} found in {1}s$($script:CNC)" -f $total, $elapsedStr)
 
     if (-not $Quiet -and $total -gt 0) {
         Write-Host ""
         if ($dGuar -gt 0) {
             $script:Guaranteed | Select-Object -Last $dGuar | ForEach-Object {
-                Write-Host ("  [{0,-9}]  {1}" -f 'CRITICAL', $_.Path)
+                Write-Host ("  [{0,-8}]  {1}" -f 'CRITICAL', $_.Path)
             }
         }
         if ($dHigh -gt 0) {
             $script:HighFindings | Select-Object -Last $dHigh | ForEach-Object {
-                Write-Host ("  [{0,-9}]  {1}" -f 'HIGH', $_.Path)
-                if ($_.Preview) { Write-Host ("             $($script:CD){0}$($script:CNC)" -f $_.Preview) }
+                Write-Host ("  [{0,-8}]  {1}" -f 'HIGH', $_.Path)
+                if ($_.Preview) { Write-Host ("              $($script:CD){0}$($script:CNC)" -f (Format-LivePreview $_.Preview)) }
             }
         }
         if ($dKey -gt 0) {
             $script:KeyFindings | Select-Object -Last $dKey | ForEach-Object {
-                Write-Host ("  [{0,-9}]  {1}" -f 'KEY', $_.Path)
-                if ($_.Preview) { Write-Host ("             $($script:CD){0}$($script:CNC)" -f $_.Preview) }
+                Write-Host ("  [{0,-8}]  {1}" -f 'KEY', $_.Path)
+                if ($_.Preview) { Write-Host ("              $($script:CD){0}$($script:CNC)" -f (Format-LivePreview $_.Preview)) }
             }
         }
         if ($dInt -gt 0) {
             $script:Interesting | Select-Object -Last $dInt | ForEach-Object {
-                Write-Host ("  [{0,-9}]  {1}" -f 'INTEREST', $_.Path)
+                Write-Host ("  [{0,-8}]  {1}" -f 'INTEREST', $_.Path)
             }
         }
         if ($dName -gt 0) {
             $script:SuspiciousNamesFound | Select-Object -Last $dName | ForEach-Object {
-                Write-Host ("  [{0,-9}]  {1}" -f 'NAME', $_)
+                Write-Host ("  [{0,-8}]  {1}" -f 'NAME', $_)
             }
         }
     }
-    Write-Host "$($script:CC)======================================================================$($script:CNC)"
 }
 
 function Stage-Skipped { param([int]$N, [string]$Title)
+    $header = "Stage $N -- $Title  [SKIPPED]"
+    $tw = 72
+    $fill = $tw - 6 - $header.Length; if ($fill -lt 3) { $fill = 3 }
     Write-Host ""
-    Write-Host "$($script:CC)======================================================================$($script:CNC)"
-    Write-Host "$($script:CBold)  Stage $N -- $Title  [SKIPPED]$($script:CNC)"
-    Write-Host "$($script:CC)======================================================================$($script:CNC)"
+    Write-Host ("  $($script:CD)$($script:CC){0}$($script:CNC) $($script:CBold){1}$($script:CNC) $($script:CD)$($script:CC){2}$($script:CNC)" -f ($script:GH * 2), $header, ($script:GH * $fill))
 }
 
 # ============================================================================
@@ -1291,11 +1338,20 @@ function Format-Preview { param([string]$Text)
     # so neither live output nor the on-disk log can carry escape sequences.
     $t = $t -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ''
     $t = $t -replace '\s+', ' '
-    $t = $t.Trim()
-    if ($t.Length -gt $script:MaxPreviewLen) {
-        $t = $t.Substring(0, $script:MaxPreviewLen) + '...'
+    # NO truncation here: the full secret is stored so the Findings section and
+    # -OutputFile log always show it whole. The live feed caps its own copy.
+    return $t.Trim()
+}
+
+# Cap a preview for the LIVE feed only (never the Findings section / log). Real
+# credentials are far shorter than the cap, so this only trims pathological
+# multi-KB lines; the complete value still appears in the Findings section.
+function Format-LivePreview { param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    if ($Text.Length -gt $script:MaxLivePreviewLen) {
+        return $Text.Substring(0, $script:MaxLivePreviewLen) + $script:GEll + ('(+{0} more)' -f ($Text.Length - $script:MaxLivePreviewLen))
     }
-    return $t
+    return $Text
 }
 
 function Get-LineNumber { param([string]$Content, [int]$Index)
@@ -1781,15 +1837,42 @@ function Test-CmdkeyVault {
     }
 }
 
+function Get-UserHiveRoots {
+    # Registry roots to search for per-user data: the current user (HKCU) plus
+    # every other loaded profile under HKEY_USERS. Running as SYSTEM/admin, HKCU
+    # is the service account's (usually empty) hive while the operator's saved
+    # PuTTY/KiTTY sessions live in another logged-on user's loaded hive -- so a
+    # manual "reg query HKCU\..." as that user finds creds an HKCU-only scan
+    # misses. The current user's SID is deduped so its sessions aren't listed
+    # twice. Other users' hives need admin/SYSTEM + the profile loaded; when not
+    # permitted the reads just fail silently, so this is safe unprivileged.
+    $roots  = @('HKCU:')
+    $curSid = $null
+    try { $curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch {}
+    try {
+        Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | ForEach-Object {
+            $sid = $_.PSChildName
+            if ($sid -like '*_Classes') { return }            # per-user file-association hive, no creds
+            if ($curSid -and $sid -eq $curSid) { return }     # already covered by HKCU
+            $roots += "Registry::HKEY_USERS\$sid"
+        }
+    } catch {}
+    $roots
+}
+
 function Test-PuTTYSessions {
     Write-Info "Stage 1.6 - PuTTY / KiTTY saved sessions"
     # Every saved session is listed for manual review (host/user + any
     # credential-named field, raw). PuTTY stores ProxyPassword in cleartext;
     # KiTTY (a PuTTY fork sharing the same layout) additionally stores a
     # cleartext/obfuscated Password field -- both are dumped regardless of the
-    # FP filter so a session can never be silently dropped.
-    Write-RegistrySessionReview -Root 'HKCU:\Software\SimonTatham\PuTTY\Sessions' -Tool 'putty'
-    Write-RegistrySessionReview -Root 'HKCU:\Software\9bis.com\KiTTY\Sessions'    -Tool 'kitty'
+    # FP filter so a session can never be silently dropped. We sweep every
+    # loaded user hive, not just HKCU, so sessions belonging to other logged-on
+    # users (the common case when running as SYSTEM/admin) are not missed.
+    foreach ($root in Get-UserHiveRoots) {
+        Write-RegistrySessionReview -Root "$root\Software\SimonTatham\PuTTY\Sessions" -Tool 'putty'
+        Write-RegistrySessionReview -Root "$root\Software\9bis.com\KiTTY\Sessions"    -Tool 'kitty'
+    }
 }
 
 function Test-WinSCPSessions {
@@ -2576,11 +2659,17 @@ function Invoke-UserPathScan { param($Files)
 #  Output / summary
 # ============================================================================
 
+function Write-SummaryRow { param([string]$Color, [string]$Label, [int]$Count)
+    $col = 50
+    $dots = $col - $Label.Length - 1; if ($dots -lt 1) { $dots = 1 }
+    Write-Host ("  $Color{0} {1} {2,5}$($script:CNC)" -f $Label, ('.' * $dots), $Count)
+}
+
 function Write-FindingsSection {
     param([string]$Title, [System.Collections.Generic.List[object]]$List, [string]$Tag, [string]$Color)
     if ($List.Count -eq 0) { return }
     Write-Host ""
-    Write-Host "$($script:CBold)$($script:CW)> $Title$($script:CNC)"
+    Write-Host "$($script:CBold)$($script:CW)$($script:GBul) $Title$($script:CNC)"
     Write-LogLine ""
     Write-LogLine "=== $Title ==="
     foreach ($f in $List | Sort-Object Label, Path, LineNumber) {
@@ -2596,7 +2685,7 @@ function Write-FullSummary {
     try {
     if ($script:Guaranteed.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)> Confirmed credential containers  !$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) Confirmed credential containers  $($script:GWarn)$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Confirmed credential containers ==="
         foreach ($g in $script:Guaranteed | Sort-Object Extension, Path) {
@@ -2614,7 +2703,7 @@ function Write-FullSummary {
     try {
     if ($script:Interesting.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)> Auxiliary credential-related files$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) Auxiliary credential-related files$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Auxiliary credential-related files ==="
         foreach ($i in $script:Interesting | Sort-Object Category, Path) {
@@ -2627,7 +2716,7 @@ function Write-FullSummary {
     try {
     if ($script:SuspiciousNamesFound.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)> Suspicious filenames (substring match)$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) Suspicious filenames (substring match)$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== Suspicious filenames (substring match) ==="
         foreach ($n in $script:SuspiciousNamesFound | Sort-Object -Unique) {
@@ -2640,7 +2729,7 @@ function Write-FullSummary {
     try {
     if ($script:LocationsChecked.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)> OS locations checked$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) OS locations checked$($script:CNC)"
         Write-LogLine ""
         Write-LogLine "=== OS locations checked ==="
         foreach ($c in $script:LocationsChecked | Sort-Object Label, Path) {
@@ -2653,7 +2742,7 @@ function Write-FullSummary {
     try {
     if ($script:SkippedFiles.Count -gt 0) {
         Write-Host ""
-        Write-Host "$($script:CBold)$($script:CW)> Skipped files$($script:CNC)"
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) Skipped files$($script:CNC)"
         Write-Host ("  $($script:CD)[SKIP]$($script:CNC) {0} file(s) skipped (binary / size / unreadable). See log." -f $script:SkippedFiles.Count)
         Write-LogLine ""
         Write-LogLine "=== Skipped files ==="
@@ -2672,17 +2761,13 @@ function Write-FullSummary {
     $nName  = $script:SuspiciousNamesFound.Count
     $nCheck = $script:LocationsChecked.Count
     $nSkip  = $script:SkippedFiles.Count
-    $fmt = "  {0,-44} {1,5}"
-    Write-Host ("$($script:CBold)" + ($fmt -f 'Category','Count') + "$($script:CNC)")
-    Write-Host ('  ' + ('-' * 44) + '  ' + ('-' * 5))
-    Write-Host ("$($script:CBold)$($script:CR)" + ($fmt -f 'Confirmed credential containers !',  $nGuar)  + "$($script:CNC)")
-    Write-Host ("$($script:CR)" + ($fmt -f 'Reusable credentials',                 $nHigh)  + "$($script:CNC)")
-    Write-Host ("$($script:CM)" + ($fmt -f 'Private keys / auth material',         $nKey)   + "$($script:CNC)")
-    Write-Host ("$($script:CC)" + ($fmt -f 'Auxiliary credential-related files',   $nInt)   + "$($script:CNC)")
-    Write-Host ("$($script:CY)" + ($fmt -f 'Suspicious filenames (substring)',     $nName)  + "$($script:CNC)")
-    Write-Host ("$($script:CB)" + ($fmt -f 'OS locations checked',                 $nCheck) + "$($script:CNC)")
-    Write-Host ("$($script:CD)" + ($fmt -f 'Files skipped (size/binary/perm)',     $nSkip)  + "$($script:CNC)")
-    Write-Host ('  ' + ('-' * 44) + '  ' + ('-' * 5))
+    Write-SummaryRow ($script:CBold + $script:CR) ("Confirmed credential containers " + $script:GWarn) $nGuar
+    Write-SummaryRow $script:CR "Reusable credentials"               $nHigh
+    Write-SummaryRow $script:CM "Private keys / auth material"        $nKey
+    Write-SummaryRow $script:CC "Auxiliary credential-related files"  $nInt
+    Write-SummaryRow $script:CY "Suspicious filenames (substring)"    $nName
+    Write-SummaryRow $script:CB "OS locations checked"                $nCheck
+    Write-SummaryRow $script:CD "Files skipped (size/binary/perm)"    $nSkip
 
     Write-LogLine ""
     Write-LogLine "Summary:"

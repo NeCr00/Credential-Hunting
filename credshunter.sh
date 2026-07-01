@@ -20,6 +20,10 @@
 # ============================================================================
 
 set -uo pipefail
+# Capture the user's real locale for glyph selection BEFORE forcing LC_ALL=C
+# below -- the C override is for deterministic regex/sort only and must not
+# downgrade the UI to ASCII on a UTF-8 terminal.
+USER_LOCALE="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
 export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 
 # Case-insensitive matching for bash [[ =~ ]] and `case` patterns. Our regex
@@ -27,11 +31,14 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.2.0"
+VERSION="2.4.0"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).
 R='' G='' Y='' B='' M='' C='' W='' D='' BOLD='' NC=''
+# Pre-initialise glyphs (ASCII) so any output before setup_glyphs is safe.
+GH='-' GHV='=' GTL='+' GTR='+' GBL='+' GBR='+'
+GBRANCH='+-' GBUL='>' GDOT='-' GELL='...' GWARN='!' GARROW='->'
 
 # Resolve the script's own canonical path so we never grep ourselves.
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
@@ -54,7 +61,12 @@ SCAN_PATHS=()
 USER_EXCLUDE_PATHS=()
 OUTPUT_FILE=""
 MAX_MATCHES_PER_FILE=20
-MAX_PREVIEW_LEN=140
+# Findings output is NEVER truncated -- the full matched secret is always shown
+# in the grouped Findings section and written to the -o log. The live per-stage
+# feed caps each preview at LIVE_PREVIEW_LEN purely so a pathological multi-KB
+# minified / base64 / log line cannot flood the terminal; any real credential is
+# far shorter and shown whole, and the complete value is always in Findings.
+LIVE_PREVIEW_LEN=2000
 # Longest line classify_line will inspect. Real credential lines are short; a
 # multi-KB minified/base64/log line would otherwise pin the per-pattern regex
 # loop. 16 KB comfortably covers single-line GPP Groups.xml / one-line JSON
@@ -125,11 +137,48 @@ setup_colors() {
     fi
 }
 
+# Box-drawing glyphs: Unicode when the locale advertises UTF-8, ASCII fallback
+# otherwise so legacy / C-locale terminals never render mojibake. Mirrored in
+# the PowerShell engine (Set-Glyphs).
+setup_glyphs() {
+    case "${USER_LOCALE:-}" in
+        *UTF-8*|*UTF8*|*utf-8*|*utf8*) USE_UNICODE=1 ;;
+        *)                             USE_UNICODE=0 ;;
+    esac
+    if [ "$USE_UNICODE" -eq 1 ]; then
+        GH='─'; GHV='═'; GTL='╭'; GTR='╮'; GBL='╰'; GBR='╯'
+        GBRANCH='└─'; GBUL='▸'; GDOT='·'; GELL='…'; GWARN='⚠'; GARROW='→'
+    else
+        GH='-'; GHV='='; GTL='+'; GTR='+'; GBL='+'; GBR='+'
+        GBRANCH='+-'; GBUL='>'; GDOT='-'; GELL='...'; GWARN='!'; GARROW='->'
+    fi
+}
+
+# Echo a horizontal rule: $1 repeated $2 times (display-column safe -- each
+# glyph is one column, so counts align in either glyph set).
+hbar() { local ch="$1" n="$2" s='' i; for ((i=0; i<n; i++)); do s+="$ch"; done; printf '%s' "$s"; }
+
+# One Summary row with a dotted leader: "  Label ........... 12"
+# The script runs under LC_ALL=C, so ${#label} counts BYTES; the warning glyph
+# is multi-byte under Unicode (3 bytes, 1 display column). Correct its width so
+# the count column stays aligned -- and byte-identical to the PowerShell engine,
+# whose .Length already counts the glyph as one unit.
+sum_row() {
+    local color="$1" label="$2" cnt="$3" col=50 dots dispw=${#2}
+    case "$label" in *"$GWARN"*) dispw=$(( dispw - ${#GWARN} + 1 )) ;; esac
+    dots=$(( col - dispw - 1 )); [ "$dots" -lt 1 ] && dots=1
+    printf '  %b%s %s %5s%b\n' "$color" "$label" "$(hbar '.' "$dots")" "$cnt" "$NC"
+}
+
 info()    { [ "$QUIET" -eq 0 ] && printf '%b[*]%b %b\n' "$B" "$NC" "$*" >&2; }
 ok()      { [ "$QUIET" -eq 0 ] && printf '%b[+]%b %b\n' "$G" "$NC" "$*" >&2; }
 warn()    { printf '%b[!]%b %b\n' "$Y" "$NC" "$*" >&2; }
 err()     { printf '%b[x]%b %b\n' "$R" "$NC" "$*" >&2; }
-section() { printf '\n%b═══ %s ═══%b\n' "${BOLD}${C}" "$*" "$NC" >&2; }
+section() {
+    local title="$1" tw=66 fill
+    fill=$(( tw - 6 - ${#title} )); [ "$fill" -lt 3 ] && fill=3
+    printf '\n  %b%s %s %s%b\n' "${BOLD}${C}" "$(hbar "$GHV" 2)" "$title" "$(hbar "$GHV" "$fill")" "$NC" >&2
+}
 
 # Stream a single Stage-1 finding to stderr as it is recorded.
 #   Args: TIER LABEL PATH [LINE]
@@ -145,14 +194,15 @@ stage1_emit() {
         INTEREST|NAME)            color="$Y" ;;
     esac
     if [ "${line:-0}" -gt 0 ] 2>/dev/null; then
-        printf '%b   └─ [%s]%b %s → %s:%s\n' "$color" "$tier" "$NC" "$label" "$path" "$line" >&2
+        printf '%b   %s [%s]%b %s %s %s:%s\n' "$color" "$GBRANCH" "$tier" "$NC" "$label" "$GARROW" "$path" "$line" >&2
     else
-        printf '%b   └─ [%s]%b %s → %s\n' "$color" "$tier" "$NC" "$label" "$path" >&2
+        printf '%b   %s [%s]%b %s %s %s\n' "$color" "$GBRANCH" "$tier" "$NC" "$label" "$GARROW" "$path" >&2
     fi
     # Show the matched content/command inline (dim) so the operator can verify
     # an embedded credential live, even when the value lives in the preview.
+    # Live feed only: capped (never the Findings section / log).
     if [ -n "$preview" ] && [ "$preview" != "$path" ]; then
-        printf '%b        %s%b\n' "$D" "$preview" >&2
+        printf '%b        %s%b\n' "$D" "$(live_preview "$preview")" "$NC" >&2
     fi
     SUBSTAGE_FINDINGS=$((SUBSTAGE_FINDINGS + 1))
 }
@@ -164,7 +214,7 @@ run_stage1_check() {
     SUBSTAGE_FINDINGS=0
     "$@"
     if [ "$SUBSTAGE_FINDINGS" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
-        printf '%b   └─ no credentials found in this category%b\n' "$D" "$NC" >&2
+        printf '%b   %s no credentials found in this category%b\n' "$D" "$GBRANCH" "$NC" >&2
     fi
 }
 
@@ -179,14 +229,17 @@ log_line() {
 # ----------------------------------------------------------------------------
 print_banner() {
     [ "$QUIET" -eq 1 ] && return
-    cat >&2 <<EOF
-
-${C}${BOLD}  ┌─────────────────────────────────────────────────────────────┐
-  │  credshunter  ·  Linux reusable-credential discovery        │
-  │  v${VERSION}  ·  ${D}authorized testing only · read-only${NC}${C}${BOLD}              │
-  └─────────────────────────────────────────────────────────────┘${NC}
-
-EOF
+    local label=' credshunter ' span=62 top bot
+    top="${GTL}$(hbar "$GH" 1)${label}$(hbar "$GH" $(( span - 1 - ${#label} )))${GTR}"
+    bot="${GBL}$(hbar "$GH" "$span")${GBR}"
+    {
+        printf '\n'
+        printf '  %b%s%b\n'                        "${C}${BOLD}" "$top" "$NC"
+        printf '     %breusable-credential discovery %s v%s %s Linux%b\n' "$W" "$GDOT" "$VERSION" "$GDOT" "$NC"
+        printf '     %bauthorized testing only %s read-only%b\n'          "$D" "$GDOT" "$NC"
+        printf '  %b%s%b\n'                        "${C}${BOLD}" "$bot" "$NC"
+        printf '\n'
+    } >&2
 }
 
 usage() {
@@ -326,7 +379,7 @@ STAGE5_EXTENSIONS=(
     # Windows-specific text formats
     reg pol rdp rdg rdcman inf unattend answerfile
     # Remote access tools
-    ovpn openvpn vnc rdc tcc ica session kix
+    ovpn openvpn vnc rdc tcc ica session script kix
     # Plain text / notes
     txt text md markdown rtf nfo log logs readme
     # Backups / temp / cached configs
@@ -875,10 +928,21 @@ sanitize() {
     v="$(printf '%s' "$v" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | tr -s '[:space:]' ' ')"
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
-    if [ "${#v}" -gt "$MAX_PREVIEW_LEN" ]; then
-        v="${v:0:$MAX_PREVIEW_LEN}…"
-    fi
+    # NO truncation here: the full secret is stored so the Findings section and
+    # -o log always show it whole. The live feed caps its own copy (live_preview).
     printf '%s' "$v"
+}
+
+# Cap a preview for the LIVE feed only (never the Findings section / log). Real
+# credentials are far shorter than the cap, so this only trims pathological
+# multi-KB lines; the complete value still appears in Findings.
+live_preview() {
+    local p="$1"
+    if [ "${#p}" -gt "$LIVE_PREVIEW_LEN" ]; then
+        printf '%s%s(+%d more)' "${p:0:$LIVE_PREVIEW_LEN}" "$GELL" "$(( ${#p} - LIVE_PREVIEW_LEN ))"
+    else
+        printf '%s' "$p"
+    fi
 }
 
 # Collapse TAB/CR/LF in a path so it stays a single, column-stable field in the
@@ -998,10 +1062,11 @@ stage_end() {
     local d_ky=$((   now_ky   - ${STAGE_BEFORE_KEY[$n]:-0}        ))
     local total=$(( d_guar + d_int + d_name + d_hi + d_ky ))
 
-    printf '\n%b======================================================================%b\n' "$C" "$NC"
-    printf '%b  Stage %s -- %s%b\n' "$BOLD" "$n" "$title" "$NC"
-    printf '%b----------------------------------------------------------------------%b\n' "$C" "$NC"
-    printf '  Found: %b%s%b file(s)   (%ss)\n' "$W$BOLD" "$total" "$NC" "$elapsed"
+    local header="Stage $n -- $title" tw=72 fill
+    fill=$(( tw - 6 - ${#header} )); [ "$fill" -lt 3 ] && fill=3
+    printf '\n  %b%s %b%s%b %b%s%b\n' \
+        "$D$C" "$(hbar "$GH" 2)" "$BOLD" "$header" "$NC" "$D$C" "$(hbar "$GH" "$fill")" "$NC"
+    printf '     %b%s found in %ss%b\n' "$D" "$total" "$elapsed" "$NC"
 
     if [ "$QUIET" -eq 0 ] && [ "$total" -gt 0 ]; then
         printf '\n'
@@ -1011,7 +1076,6 @@ stage_end() {
         stage_print_delta INTEREST  "$INTEREST_FILE"   "${STAGE_BEFORE_INTEREST[$n]:-0}"   "$d_int"
         stage_print_delta NAME      "$NAME_FILE"       "${STAGE_BEFORE_NAME[$n]:-0}"       "$d_name"
     fi
-    printf '%b======================================================================%b\n' "$C" "$NC"
 }
 
 # Print delta lines from a tier file as: [TIER]  /path
@@ -1023,13 +1087,24 @@ stage_print_delta() {
     local start=$((before + 1))
     case "$tier" in
         HIGH|KEY)
-            tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ printf "  [%-9s]  %s\n", t, $2 }'
+            # path line, then the FULL matched value indented beneath it (dim).
+            # Only the live feed is capped (LIVE_PREVIEW_LEN); Findings show all.
+            tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" -v d="$D" -v nc="$NC" \
+                -v cap="$LIVE_PREVIEW_LEN" -v ell="$GELL" '
+                {
+                    printf "  [%-8s]  %s\n", t, $2
+                    if ($4 != "") {
+                        p = $4
+                        if (length(p) > cap) p = substr(p, 1, cap) ell "(+" (length(p) - cap) " more)"
+                        printf "              %s%s%s\n", d, p, nc
+                    }
+                }'
             ;;
         INTEREST|NAME)
-            tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ p=$NF; printf "  [%-9s]  %s\n", t, p }'
+            tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ p=$NF; printf "  [%-8s]  %s\n", t, p }'
             ;;
         CRITICAL)
-            tail -n "+$start" "$file" | awk -F'\t' '{ printf "  [%-9s]  %s\n", "CRITICAL", $2 }'
+            tail -n "+$start" "$file" | awk -F'\t' '{ printf "  [%-8s]  %s\n", "CRITICAL", $2 }'
             ;;
     esac
 }
@@ -1037,9 +1112,10 @@ stage_print_delta() {
 # Print the SKIPPED variant of a stage block.
 stage_skipped() {
     local n=$1 title="$2"
-    printf '\n%b======================================================================%b\n' "$C" "$NC"
-    printf '%b  Stage %s -- %s  [SKIPPED]%b\n' "$BOLD" "$n" "$title" "$NC"
-    printf '%b======================================================================%b\n' "$C" "$NC"
+    local header="Stage $n -- $title  [SKIPPED]" tw=72 fill
+    fill=$(( tw - 6 - ${#header} )); [ "$fill" -lt 3 ] && fill=3
+    printf '\n  %b%s %b%s%b %b%s%b\n' \
+        "$D$C" "$(hbar "$GH" 2)" "$BOLD" "$header" "$NC" "$D$C" "$(hbar "$GH" "$fill")" "$NC"
 }
 
 # ============================================================================
@@ -1884,7 +1960,7 @@ scan_user_paths_contents() {
 # ============================================================================
 
 print_section_header() {
-    printf '\n%b▸ %s%b\n' "${BOLD}${W}" "$1" "$NC"
+    printf '\n%b%s %s%b\n' "${BOLD}${W}" "$GBUL" "$1" "$NC"
     log_line ""
     log_line "=== $1 ==="
 }
@@ -1981,16 +2057,13 @@ print_summary() {
     n_skip=$( [ -s "$SKIPPED_FILE" ] && wc -l <"$SKIPPED_FILE" | tr -d ' ' || echo 0)
 
     section "Summary"
-    printf '  %b%-44s %s%b\n' "$BOLD" "Category" "Count" "$NC"
-    printf '  %s\n' "────────────────────────────────────────────  ─────"
-    printf '  %b%b%-44s %5d%b\n' "$BOLD" "$R" "Confirmed credential containers ⚠" "$n_guar" "$NC"
-    printf '  %b%-44s %5d%b\n' "$R" "Reusable credentials"                "$n_high"  "$NC"
-    printf '  %b%-44s %5d%b\n' "$M" "Private keys / auth material"        "$n_key"   "$NC"
-    printf '  %b%-44s %5d%b\n' "$C" "Auxiliary credential-related files"  "$n_int"   "$NC"
-    printf '  %b%-44s %5d%b\n' "$Y" "Suspicious filenames (substring)"    "$n_name"  "$NC"
-    printf '  %b%-44s %5d%b\n' "$B" "OS locations checked"                "$n_check" "$NC"
-    printf '  %b%-44s %5d%b\n' "$D" "Files skipped (size/binary/perm)"    "$n_skip"  "$NC"
-    printf '  %s\n' "────────────────────────────────────────────  ─────"
+    sum_row "$BOLD$R" "Confirmed credential containers $GWARN" "$n_guar"
+    sum_row "$R"      "Reusable credentials"                   "$n_high"
+    sum_row "$M"      "Private keys / auth material"           "$n_key"
+    sum_row "$C"      "Auxiliary credential-related files"     "$n_int"
+    sum_row "$Y"      "Suspicious filenames (substring)"       "$n_name"
+    sum_row "$B"      "OS locations checked"                   "$n_check"
+    sum_row "$D"      "Files skipped (size/binary/perm)"       "$n_skip"
 
     log_line ""
     log_line "Summary:"
@@ -2014,6 +2087,7 @@ print_summary() {
 main() {
     parse_args "$@"
     setup_colors
+    setup_glyphs
     build_combined_regex   # build the merged alternation regex once
     print_banner
 
