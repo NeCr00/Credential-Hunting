@@ -498,6 +498,10 @@ CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
     'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
 
+    # PHP associative-array assignments, e.g. $sql['password']='secret' or
+    # $sql_root[0]['password'] = 'secret'.
+    "php_array_password|\\[['\"](password|passwd|passphrase|pwd|secret)['\"]\\][[:space:]]*(=|=>)[[:space:]]*['\"]([^'\"]{3,})['\"]"
+
     # ── DB / service-prefixed passwords ──────────────────────────────────
     'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
     # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
@@ -1193,6 +1197,12 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
+                php_array_password)
+                    local php_array_regex="\\[['\"](password|passwd|passphrase|pwd|secret)['\"]\\][[:space:]]*(=|=>)[[:space:]]*['\"]([^'\"]{3,})['\"]"
+                    if [[ "$content" =~ $php_array_regex ]]; then
+                        value="${BASH_REMATCH[3]}"
+                    fi
+                    ;;
                 drupal_password|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
