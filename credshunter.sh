@@ -460,6 +460,12 @@ parse_args() {
     [[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]] || { err "max-size must be a number"; exit 2; }
     [ "$MAX_FILE_SIZE_MB" -ge 1 ] || { err "max-size must be >= 1 (got '$MAX_FILE_SIZE_MB')"; exit 2; }
 
+    # Snapshot how many entries of EXCLUDE_PATHS are BUILT-IN, before the user's
+    # -x entries are appended below. reconcile_scan_path_excludes() may disable a
+    # built-in prefix that swallows a requested -p path; a user's explicit -x is
+    # never auto-disabled.
+    BUILTIN_EXCLUDE_COUNT=${#EXCLUDE_PATHS[@]}
+
     # Normalise user exclusions WITHOUT canonicalising — `find` emits paths
     # using whatever prefix the start directory had (e.g. /tmp not /private/tmp
     # on macOS). Add the canonical form too as a fallback.
@@ -493,22 +499,32 @@ parse_args() {
 #     dominate noise on real hosts and are rarely useful in-network.
 #   * Every key=value pattern requires a value with at least 3 non-space,
 #     non-comment, non-template chars to reduce empty / placeholder hits.
+#   * '$' handling: the value classes below reject '$' as the FIRST character
+#     (so `password=$DB_PASSWORD` / `password=${PW}` stay out — those are
+#     variable references, not secrets) but ALLOW it from the second character
+#     on. Rejecting '$' outright, as these patterns used to, silently dropped
+#     every real password containing one -- P@$$w0rd!, Pa$$w0rd123 and friends,
+#     which are among the most common passwords on a real AD estate. That also
+#     contradicted is_false_positive(), whose comment states such values are
+#     "intentionally KEPT — dropping them would miss genuine credentials".
+#     The split class is a strict superset of the old one: nothing that matched
+#     before can stop matching now.
 
 CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
-    'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}][^[:space:]"#<>{}]{2,}'
 
     # PHP associative-array assignments, e.g. $sql['password']='secret' or
     # $sql_root[0]['password'] = 'secret'.
     "php_array_password|\\[['\"](password|passwd|passphrase|pwd|secret)['\"]\\][[:space:]]*(=|=>)[[:space:]]*['\"]([^'\"]{3,})['\"]"
 
     # ── DB / service-prefixed passwords ──────────────────────────────────
-    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}][^[:space:]"#<>{}]{2,}'
     # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
     # keystone_password, nova_password, app_password, mail_pass, ...). The
     # value FP filter removes references/placeholders. Placed AFTER db_password
     # so the well-known prefixes keep their specific label.
-    'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}][^[:space:]"#<>{}]{2,}'
 
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
@@ -529,7 +545,7 @@ CRED_PATTERNS=(
     'autologon_password|(DefaultPassword|AltDefaultPassword)[[:space:]]*[:=][[:space:]"]*[^[:space:]"#]{2,}'
 
     # ── Environment-variable credentials ─────────────────────────────────
-    'env_password|(^|[[:space:]])(set[[:space:]]+|export[[:space:]]+|setx[[:space:]]+)?[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*[[:space:]]*=[[:space:]]*['"'"'"]?[^[:space:]"$<>]{3,}'
+    'env_password|(^|[[:space:]])(set[[:space:]]+|export[[:space:]]+|setx[[:space:]]+)?[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*[[:space:]]*=[[:space:]]*['"'"'"]?[^[:space:]"$<>][^[:space:]"<>]{2,}'
     'pgpassword_env|PGPASSWORD[[:space:]]*=[[:space:]]*['"'"'"]?[^[:space:]"#]{3,}'
     'mysql_pwd_env|MYSQL_PWD[[:space:]]*=[[:space:]]*['"'"'"]?[^[:space:]"#]{3,}'
 
@@ -570,7 +586,9 @@ CRED_PATTERNS=(
     'ps_localuser|(New-LocalUser|Add-LocalUser|Set-LocalUser)[[:space:]].*-(Password|AccountPassword)[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"']'
     'ps_adsetpass|(Set-ADAccountPassword|New-ADUser)[[:space:]].*-(AccountPassword|NewPassword)[[:space:]]'
     # Robust: handles positional or -String, and -Force is optional.
-    'ps_secstring_plain|ConvertTo-SecureString[[:space:]]+(-String[[:space:]]+)?["'"'"'][^"'"'"']{3,}["'"'"'][[:space:]]+(-Key[[:space:]]+\S+[[:space:]]+)?-AsPlainText'
+    # [^[:space:]] not \S (see netrc_password): with \S the -Key variant of this
+    # pattern never matched in classify_line.
+    'ps_secstring_plain|ConvertTo-SecureString[[:space:]]+(-String[[:space:]]+)?["'"'"'][^"'"'"']{3,}["'"'"'][[:space:]]+(-Key[[:space:]]+[^[:space:]]+[[:space:]]+)?-AsPlainText'
     # Plaintext password passed to a cmdlet -Password/-AccountPassword param
     # as a quoted literal (secure-string objects use $vars -> not matched).
     'ps_password_param|-(Password|Pass|AccountPassword|AdminPassword|NewPassword|DefaultPassword)[[:space:]]+["'"'"'][^"'"'"']{3,}["'"'"']'
@@ -591,7 +609,9 @@ CRED_PATTERNS=(
     'sc_config_pass|sc(\.exe)?[[:space:]]+config[[:space:]].*password=[[:space:]]*[^[:space:]"]{2,}'
     'schtasks_pass|schtasks[[:space:]].*/rp[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
     'evilwinrm_cmd|evil-winrm[[:space:]].*-p[[:space:]]+['"'"'"]?[^[:space:]'"'"'"]{2,}'
-    'impacket_cred|(impacket-\S+|psexec\.py|wmiexec\.py|smbexec\.py|secretsdump\.py|GetUserSPNs\.py|GetNPUsers\.py)[[:space:]].*[^[:space:]/]+/[^:[:space:]]+:[^@[:space:]]{3,}@'
+    # [^[:space:]] not \S -- see the netrc_password note below; with \S the
+    # impacket-* alternative never matched in classify_line.
+    'impacket_cred|(impacket-[^[:space:]]+|psexec\.py|wmiexec\.py|smbexec\.py|secretsdump\.py|GetUserSPNs\.py|GetNPUsers\.py)[[:space:]].*[^[:space:]/]+/[^:[:space:]]+:[^@[:space:]]{3,}@'
 
     # ── Web framework specifics ──────────────────────────────────────────
     'wp_db_password|define\([[:space:]]*['"'"'"]DB_PASSWORD['"'"'"][[:space:]]*,[[:space:]]*['"'"'"][^'"'"'"]{2,}'
@@ -608,7 +628,13 @@ CRED_PATTERNS=(
 
     # ── Linux auth files ─────────────────────────────────────────────────
     'htpasswd_hash|^[^:[:space:]#]+:\$(apr1|2[aby]?|5|6|y)\$'
-    'netrc_password|^[[:space:]]*(machine[[:space:]]+\S+[[:space:]]+)?(login|user|username)[[:space:]]+\S+[[:space:]]+password[[:space:]]+\S{2,}'
+    # NOTE: use [^[:space:]], never \S. Every pattern here is evaluated TWICE --
+    # once by `grep -E` (prefilter) and once by bash `[[ =~ ]]` (classify_line).
+    # \S is a GNU grep extension that POSIX ERE does not define, so bash matches
+    # it as a literal 'S': grep selects the line, the classifier then fails to
+    # match it, and the finding is silently dropped. This pattern was 100% dead
+    # for that reason -- no .netrc credential could ever be reported.
+    'netrc_password|^[[:space:]]*(machine[[:space:]]+[^[:space:]]+[[:space:]]+)?(login|user|username)[[:space:]]+[^[:space:]]+[[:space:]]+password[[:space:]]+[^[:space:]]{2,}'
     'sudoers_nopasswd|^[[:space:]]*[^#][^[:space:]]*[[:space:]].*NOPASSWD[[:space:]]*[:=]'
     'samba_password|^[[:space:]]*(passwd|password|smb[[:space:]]+passwd)[[:space:]]*=[[:space:]]*[^[:space:]]{3,}'
     # LDAP bind password (OpenLDAP/nslcd/sssd) and IPsec pre-shared key
@@ -781,7 +807,6 @@ is_false_positive() {
         # Placeholder tag like <password> / <your-pw> (a letter must follow '<';
         # keeps real passwords containing '<3' etc. that PS also keeps).
         *'<'[A-Za-z_]*'>'*) return 0 ;;
-        *'$1'*|*'$2'*|*'$3'*|*'$$'*) return 0 ;;
         *'%'[A-Z_]*'%'*) return 0 ;;
         *'@@'*|*'__'*'__'*) return 0 ;;
     esac
@@ -797,6 +822,16 @@ is_false_positive() {
     # merely start with '$' (e.g. $Pass123, $ecretP@ss) are intentionally
     # KEPT — dropping them would miss genuine credentials.
     [[ "$v" =~ ^\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
+
+    # Value that IS a sed/awk positional backref ($1/$2/$3), a ${1} form, or the
+    # shell PID ($$). ANCHORED to the WHOLE value, matching the PowerShell engine.
+    # This used to be a *substring* test (*'$1'*|*'$2'*|*'$3'*|*'$$'*), which
+    # discarded real passwords that merely CONTAIN those two characters --
+    # P@$$w0rd! and Summer$2024 were both dropped, exactly the kind of weak/real
+    # credential the comment above (and the FALSE_POSITIVE_EXACT note) says must
+    # be kept. Interpolation markers like ${VAR} are still caught by the
+    # *'${'* case above.
+    [[ "$v" =~ ^\$(\$|[0-9]+|\{[0-9]+\})$ ]] && return 0
 
     # Already-encrypted / vaulted markers — these mean the secret is
     # protected at rest; we don't double-report them as plaintext.
@@ -954,7 +989,12 @@ live_preview() {
 # enumeration is NUL-safe a newline in a path would otherwise split a TSV record
 # into two phantom lines (wrong line numbers / garbled paths). Result -> REPLY
 # (no subshell, so this stays cheap on the per-file record_skip/record_checked).
-_clean_path() { REPLY="${1//$'\t'/ }"; REPLY="${REPLY//$'\r'/ }"; REPLY="${REPLY//$'\n'/ }"; }
+# ESC is stripped too: a path is attacker-influencable content that gets echoed
+# to the operator's terminal and into the -o log, so an ESC in a filename would
+# smuggle an ANSI sequence through. sanitize() already enforces this for scanned
+# file CONTENT; paths were the one route that bypassed it. Pure parameter
+# expansion, so this stays a no-fork helper on the per-file hot path.
+_clean_path() { REPLY="${1//$'\t'/ }"; REPLY="${REPLY//$'\r'/ }"; REPLY="${REPLY//$'\n'/ }"; REPLY="${REPLY//$'\e'/ }"; }
 
 record_finding() {
     # Args: BUCKET LABEL FILE LINE PREVIEW
@@ -1182,9 +1222,28 @@ classify_line() {
             # where the first colon is the clock. Locate the password
             # keyword instead, then read whatever immediately follows ITS
             # operator. Falls back to the full content if no kv shape.
+            # The separator group is REQUIRED (operator, quote, or whitespace) so
+            # the keyword only splits a real key=value shape. It used to be
+            # optional ([[:space:]]*[:=]?[[:space:]]*), which let the keyword cut
+            # the password itself in half: `net user bob Password1` extracted the
+            # value "1", which the FP filter then dropped as too short -- a real
+            # credential silently lost. With a required separator there is no
+            # match on such a line, so `value` stays the whole content (which the
+            # FP filter passes) instead of a fragment.
+            # The leading ["'] alternative absorbs a quoted KEY's closing quote so
+            # the common JSON/XML shape  "password": "value"  yields the value and
+            # not `: "value",`  -- the latter defeated the placeholder check, so
+            #  "password": "example"  was reported as a finding.
             value="$content"
-            if [[ "$content" =~ (password|passwd|passphrase|pass|pwd|cpassword|requirepass|rootpw|cred(ential)?s?|secret)[[:space:]]*[:=]?[[:space:]]*(.+)$ ]]; then
-                value="${BASH_REMATCH[3]}"
+            if [[ "$content" =~ (password|passwd|passphrase|pass|pwd|cpassword|requirepass|rootpw|cred(ential)?s?|secret)(["'"'"']?[[:space:]]*[:=][[:space:]]*|["'"'"'][[:space:]]*|[[:space:]]+)(.+)$ ]]; then
+                value="${BASH_REMATCH[4]}"
+                # A quoted value ends at its closing quote; whatever follows is
+                # surrounding syntax, not secret ( "example" },  /  "example", ).
+                # Unterminated quote -> the %% cut finds nothing and value stands.
+                case "$value" in
+                    '"'*) value="${value#\"}"; value="${value%%\"*}" ;;
+                    "'"*) value="${value#\'}"; value="${value%%\'*}" ;;
+                esac
                 value="${value%%#*}"
                 value="${value%%;*}"
                 # Cut at ", " / " -> " / "  message=" — common log noise
@@ -1754,6 +1813,50 @@ EXCLUDE_PATHS=(
     /tmp/.X11-unix /tmp/.ICE-unix /tmp/.font-unix
 )
 
+# A -p path the operator asked for EXPLICITLY that lives inside a BUILT-IN
+# exclude prefix is worse than useless today: the prune expression matches the
+# find START POINT itself, so `find` prunes it immediately and the scan returns
+# ZERO files with no warning. `-p /var/log` is the clearest case -- the
+# EXCLUDE_PATHS comment literally says "Log dirs — noisy; opt in via -p /var/log",
+# and that documented opt-in cannot work. Same for -p /usr/share/nginx/html
+# (a stock nginx docroot under the excluded /usr/share), -p /boot, -p /snap.
+#
+# The built-in prefixes exist to keep a broad `-p /` sweep fast, not to veto a
+# targeted request, so drop any BUILT-IN prefix that contains (or equals) a
+# requested scan path and tell the operator. User -x entries are left alone, so
+# an explicit exclusion still wins over an explicit path.
+DISABLED_EXCLUDES=()
+reconcile_scan_path_excludes() {
+    [ "${#SCAN_PATHS[@]}" -eq 0 ] && return 0
+    [ "${#EXCLUDE_PATHS[@]}" -eq 0 ] && return 0
+    local roots=() p abs
+    for p in "${SCAN_PATHS[@]}"; do
+        case "$p" in /*) abs="$p" ;; *) abs="$(pwd)/$p" ;; esac
+        [ "${#abs}" -gt 1 ] && abs="${abs%/}"
+        roots+=("$abs")
+    done
+    local kept=() i pref r covered
+    for ((i = 0; i < ${#EXCLUDE_PATHS[@]}; i++)); do
+        pref="${EXCLUDE_PATHS[$i]}"
+        covered=0
+        if [ "$i" -lt "${BUILTIN_EXCLUDE_COUNT:-0}" ]; then
+            for r in "${roots[@]}"; do
+                if [ "$r" = "$pref" ] || [ "${r#"$pref"/}" != "$r" ]; then
+                    covered=1; break
+                fi
+            done
+        fi
+        if [ "$covered" -eq 1 ]; then
+            DISABLED_EXCLUDES+=("$pref")
+        else
+            kept+=("$pref")
+        fi
+    done
+    # `${arr[@]+...}` guard: an empty array under `set -u` is an error on
+    # bash < 4.4, and this script supports bash 4+.
+    EXCLUDE_PATHS=( ${kept[@]+"${kept[@]}"} )
+}
+
 # ============================================================================
 #  Stages 2-5 — recursive scanning of user-supplied paths
 # ============================================================================
@@ -1763,6 +1866,13 @@ EXCLUDE_PATHS=(
 # expands to:  ( -type d -name X -o -path Y -o -path Y/* ... ) -prune -o
 # which find reads as "prune these subtrees, otherwise fall through to the match
 # expression that follows". Reused by every stage.
+#
+# NOTE: every stage-2..5 walk runs `find -H "$path"`. Without -H, find does not
+# follow a symlink given as a START POINT, so `-p /var/www` where /var/www is a
+# symlink to /srv/www enumerated NOTHING and stages 2-4 reported it silently.
+# -H follows command-line arguments ONLY: symlinks encountered *inside* the tree
+# are still not followed, so the traversal stays loop-free and cannot escape the
+# requested path (verified: -H does not change in-tree behaviour).
 FIND_EXCLUDE_ARGS=()
 build_find_excludes() {
     [ "${#FIND_EXCLUDE_ARGS[@]}" -gt 0 ] && return   # compose once, reuse forever
@@ -1791,7 +1901,7 @@ find_guaranteed_credentials() {
             [ -z "$f" ] && continue
             local ext_only="${f##*.}"
             record_guaranteed "${ext_only,,}" "$f"
-        done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
+        done < <(find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
     done
     if [ -s "$GUARANTEED_FILE" ]; then
         sort -u "$GUARANTEED_FILE" -o "$GUARANTEED_FILE"
@@ -1840,7 +1950,7 @@ find_high_value_files() {
             done
             [ "$skip" -eq 1 ] && continue
             record_interest "high_value_file" "$f"
-        done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
+        done < <(find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
     done
 }
 
@@ -1888,7 +1998,7 @@ find_suspicious_filenames() {
             done
         # -mindepth 1 prevents the SCAN_PATH itself from being flagged
         # (running with -p /etc/passwd shouldn't emit /etc/passwd as a finding).
-        done < <(find "$path" -mindepth 1 "${FIND_EXCLUDE_ARGS[@]}" -type f \
+        done < <(find -H "$path" -mindepth 1 "${FIND_EXCLUDE_ARGS[@]}" -type f \
             ! -iname '*.dll' ! -iname '*.exe' ! -iname '*.sys' ! -iname '*.so' \
             ! -iname '*.dylib' ! -iname '*.ocx' ! -iname '*.pdb' ! -iname '*.nupkg' \
             ! -iname '*.mui' ! -iname '*.cpl' ! -iname '*.drv' \
@@ -1933,10 +2043,10 @@ enumerate_candidates() {
     for path in "${SCAN_PATHS[@]}"; do
         [ -e "$path" ] || { warn "Path does not exist: $path"; continue; }
         if [ "$ALL_MODE" -eq 1 ]; then
-            find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" -print0 2>/dev/null
+            find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" -print0 2>/dev/null
         else
             local name_expr=( '(' "${name_args[@]:1}" ')' )
-            find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" "${name_expr[@]}" -print0 2>/dev/null
+            find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${size_args[@]+"${size_args[@]}"}" "${name_expr[@]}" -print0 2>/dev/null
         fi
     done
 }
@@ -2096,6 +2206,7 @@ print_summary() {
 
 main() {
     parse_args "$@"
+    reconcile_scan_path_excludes
     setup_colors
     setup_glyphs
     build_combined_regex   # build the merged alternation regex once
@@ -2112,6 +2223,16 @@ main() {
         local p
         for p in "${USER_EXCLUDE_PATHS[@]}"; do
             printf '       %b- %s%b\n' "$D" "$p" "$NC" >&2
+        done
+    fi
+
+    # Built-in excludes that a requested -p path sits inside are disabled rather
+    # than silently pruning that whole tree — say so, it changes what gets walked.
+    if [ "${#DISABLED_EXCLUDES[@]}" -gt 0 ]; then
+        info "Built-in exclusion(s) disabled (${W}${#DISABLED_EXCLUDES[@]}${NC}) — a requested -p path lies inside them:"
+        local dp
+        for dp in "${DISABLED_EXCLUDES[@]}"; do
+            printf '       %b- %s%b\n' "$D" "$dp" "$NC" >&2
         done
     fi
 

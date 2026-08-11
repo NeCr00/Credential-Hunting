@@ -299,6 +299,17 @@ $script:RawPatterns = @(
     @{ Label = 'password_assign';
        Regex = '(?im)(^|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
 
+    # PHP associative-array assignment:  $sql['password'] = 'secret'  or
+    # $cfg['Servers'][$i]['password'] => "secret". password_assign cannot match
+    # these -- the `]` sits between the key's closing quote and the operator, so
+    # its `["']?\s*[:=]` never lines up. drupal_password covers only the `=>`
+    # form with the literal key 'password'. Ported from the bash engine, which
+    # has carried this pattern since the PHP-array fix; kept in the same slot
+    # (right after password_assign) so first-match-wins labelling matches there.
+    # Group 3 is the value literal -- extracted directly at scan time.
+    @{ Label = 'php_array_password';
+       Regex = '(?i)\[["''](password|passwd|passphrase|pwd|secret)["'']\]\s*(=>?)\s*["'']([^"'']{3,})["'']' }
+
     # ---- DB / service-prefixed passwords ------------------------------------
     @{ Label = 'db_password';
        Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
@@ -579,8 +590,13 @@ $script:NoFPCheck = @(
 #   * URL creds (any scheme) -> ://user:pass@
 #   * hash dumps / shadow / kerberos / mscash -> hex32::: , $..$ , M$..#hex32
 #   * command-line tools that carry no 'pass' keyword -> explicit tool names
+#
+# NOTE on argon2: the id/i/d variant suffix is part of the marker ($argon2id$,
+# $argon2i$, $argon2d$ -- a bare $argon2$ does not exist), so the alternation
+# below must allow it. Without the suffix the anchor never matched a real hash
+# and the shadow_argon2 pattern could never fire.
 $script:KeywordPrefilter = [regex]::new(
-    '(?i)pass|pwd|rootpw|secret|credential|securestring|bindpw|://[^\s/:@]+:[^\s/@]+@|[A-Fa-f0-9]{32}:::|\$(?:apr1|1|2[aby]?|5|6|y|argon2|krb5tgs|krb5asrep|dcc2)\$|M\$[A-Za-z0-9._-]+#[A-Fa-f0-9]{32}|jdbc:|:\s*PSK\s|wp-config|configuration\.php|appsettings|web\.config|tomcat-users|cmdkey|runas|psexec|smbclient|net\s+use|net\s+user|wmic|schtasks|evil-winrm|new-localuser|set-localuser|add-localuser|set-adaccountpassword|new-aduser|-pw\b|/p:|mysql|psql|mongo|redis-cli|xfreerdp|freerdp|rdesktop|mstsc|plink|ldap|snmpwalk|mosquitto_|sqlcmd|osql|\bbcp\b|impacket|\.py\b|kinit|useradd|usermod|lftp|nmcli|openssl|curl|wget|gpg|\b7z\b|\bzip\b|unzip|rocommunity|rwcommunity|com2sec|\bpdo\b|pg_connect|new\s+mysqli|define\s*\(|->\s*connect',
+    '(?i)pass|pwd|rootpw|secret|credential|securestring|bindpw|://[^\s/:@]+:[^\s/@]+@|[A-Fa-f0-9]{32}:::|\$(?:apr1|1|2[aby]?|5|6|y|argon2(?:id|i|d)?|krb5tgs|krb5asrep|dcc2)\$|M\$[A-Za-z0-9._-]+#[A-Fa-f0-9]{32}|jdbc:|:\s*PSK\s|wp-config|configuration\.php|appsettings|web\.config|tomcat-users|cmdkey|runas|psexec|smbclient|net\s+use|net\s+user|wmic|schtasks|evil-winrm|new-localuser|set-localuser|add-localuser|set-adaccountpassword|new-aduser|-pw\b|/p:|mysql|psql|mongo|redis-cli|xfreerdp|freerdp|rdesktop|mstsc|plink|ldap|snmpwalk|mosquitto_|sqlcmd|osql|\bbcp\b|impacket|\.py\b|kinit|useradd|usermod|lftp|nmcli|openssl|curl|wget|gpg|\b7z\b|\bzip\b|unzip|rocommunity|rwcommunity|com2sec|\bpdo\b|pg_connect|new\s+mysqli|define\s*\(|->\s*connect',
     [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 # ============================================================================
@@ -971,7 +987,12 @@ $script:ExcludePathPrefixes = @(
     (Join-Path $env:ProgramData 'Microsoft\Device Stage')
     (Join-Path $env:ProgramData 'Microsoft\NetFramework\BreadcrumbStore')
     (Join-Path $env:ProgramData 'Vmware')
-    (Join-Path $env:ProgramData 'Microsoft\')
+    # NOTE: a blanket ProgramData\Microsoft entry used to sit here written as
+    # 'Microsoft\'. The trailing separator made it dead code -- Test-DirectoryExcluded
+    # compares against "$prefix + $sep", i.e. "...\Microsoft\\", which no real path
+    # ever matches. The blanket exclusion lives in $script:DefaultSystemExcludePrefixes
+    # below instead, which is the correct place for it: -NoDefaultExclude can then
+    # re-enable that tree, which an always-on entry here would have prevented.
 ) | Where-Object { $_ -and $_.Trim() -ne '' }
 
 # Well-known system / vendor directories that never hold hardcoded credentials.
@@ -1036,6 +1057,42 @@ $script:DefaultSystemExcludePrefixes = @(
 
 if (-not $NoDefaultExclude) {
     $script:ExcludePathPrefixes = @($script:ExcludePathPrefixes) + $script:DefaultSystemExcludePrefixes
+}
+
+# A -Path the operator asked for EXPLICITLY that happens to live inside a built-in
+# exclude prefix was silently gutted: Get-WalkedFiles pushes the requested root
+# unconditionally, but every subdirectory under it then matched the prefix and was
+# skipped -- so `-Path C:\Windows\Panther` or
+# `-Path 'C:\Program Files\Microsoft SQL Server'` returned only the root's own files,
+# with no warning that the rest of the tree had been dropped. The built-in prefixes
+# exist to keep a broad `-Path C:\` sweep fast, not to veto a targeted request, so
+# drop any built-in prefix that CONTAINS (or equals) a requested root and tell the
+# operator. Runs BEFORE the user's -ExcludePath entries are appended, so an explicit
+# exclusion always still wins over an explicit path.
+$script:DisabledExcludePrefixes = @()
+if ($Path.Count -gt 0 -and @($script:ExcludePathPrefixes).Count -gt 0) {
+    $reqRoots = @()
+    foreach ($rp in $Path) {
+        if ([string]::IsNullOrWhiteSpace($rp)) { continue }
+        try { $rabs = [System.IO.Path]::GetFullPath($rp) } catch { $rabs = $rp }
+        $rabs = $rabs.TrimEnd('\','/')
+        if ($rabs.Length -gt 0) { $reqRoots += $rabs }
+    }
+    if ($reqRoots.Count -gt 0) {
+        $sepChar = [System.IO.Path]::DirectorySeparatorChar
+        $keptPrefixes = @()
+        foreach ($pref in $script:ExcludePathPrefixes) {
+            $covered = $false
+            foreach ($rr in $reqRoots) {
+                if ($rr.Equals($pref, [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $rr.StartsWith($pref + $sepChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $covered = $true; break
+                }
+            }
+            if ($covered) { $script:DisabledExcludePrefixes += $pref } else { $keptPrefixes += $pref }
+        }
+        $script:ExcludePathPrefixes = $keptPrefixes
+    }
 }
 
 # Path-substring exclusions -- used when the noisy directory lives at a
@@ -1297,14 +1354,21 @@ function Read-TextFileSmart {
     }
 }
 
-function Test-DirectoryExcluded { param([string]$DirectoryPath)
+function Test-DirectoryExcluded { param([string]$DirectoryPath, $KnownAttributes = $null)
     # Never descend into reparse points (directory junctions / symlinks).
     # [System.IO.Directory]::EnumerateDirectories returns them as ordinary
     # directories, so without this guard a self-referential junction loops
     # forever and a junction targeting C:\ lets the scan escape -Path. GNU find
     # on the bash side never follows symlinks (no -L), so this restores parity.
+    #
+    # -KnownAttributes lets the caller hand in the DirectoryInfo.Attributes it
+    # already holds. Those come from the directory find-data the enumeration
+    # already read (same reason .Length is free for files in Get-WalkedFiles), so
+    # passing them removes one filesystem metadata call PER DIRECTORY -- on a C:\
+    # sweep that is one avoided syscall for every directory on the volume.
     try {
-        $attr = [System.IO.File]::GetAttributes($DirectoryPath)
+        $attr = if ($null -ne $KnownAttributes) { $KnownAttributes }
+                else { [System.IO.File]::GetAttributes($DirectoryPath) }
         if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
     } catch { return $true }   # unreadable attributes -> safest to skip
     try {
@@ -1579,18 +1643,51 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             # a word char, which would break db_password) and list longest-first so
             # the value is taken after the real keyword, never after a pass-like
             # substring inside "bypass" / "compass" / "passenger".
+            # A trailing (?![A-Za-z0-9]) makes the keyword a COMPLETE token: without
+            # it, `net user bob Password1` split the password itself and left the
+            # value "1", which the FP filter then dropped as too short -- a real
+            # credential silently lost. When the keyword is only a prefix of the
+            # value token there is no key/value split to make, so we fall back to
+            # the whole line (which the FP filter passes) rather than a fragment.
+            # The optional ["'] absorbs a quoted KEY's closing quote so the common
+            # JSON/XML shape  "password": "value"  yields `value` and not
+            # `: "value",` -- the latter defeated the placeholder check, so
+            #  "password": "example"  was reported as a finding.
             $value = $line
             $kwMatch = [regex]::Match($line,
-                '(?i)(?<![A-Za-z])(?:cpassword|passphrase|password|passwd|requirepass|rootpw|credentials?|cred|secret|pass|pwd)\s*[:=]?\s*',
+                '(?i)(?<![A-Za-z])(?:cpassword|passphrase|password|passwd|requirepass|rootpw|credentials?|cred|secret|pass|pwd)(?![A-Za-z0-9])["'']?\s*[:=]?\s*',
                 [System.Text.RegularExpressions.RegexOptions]::None)
             if ($kwMatch.Success) {
-                $value = $line.Substring($kwMatch.Index + $kwMatch.Length)
-                $value = $value.Trim().Trim('"', "'", ' ', ';')
+                $value = $line.Substring($kwMatch.Index + $kwMatch.Length).Trim()
+                # A QUOTED value ends at its closing quote; whatever follows is
+                # surrounding syntax, not secret. Trimming alone cannot do this --
+                #   "password": "example" },
+                # trims to `example" }` (the brace blocks it) and the placeholder
+                # check then fails to recognise it. Unterminated quote -> leave as-is.
+                if ($value.Length -gt 1 -and ($value[0] -eq '"' -or $value[0] -eq "'")) {
+                    $q = $value[0]
+                    $close = $value.IndexOf($q, 1)
+                    if ($close -gt 1) { $value = $value.Substring(1, $close - 1) }
+                }
+                # ',' trimmed too: a trailing comma is JSON/array punctuation, never
+                # part of the secret. Affects only the FP comparison -- the finding
+                # preview still carries the whole original line.
+                $value = $value.Trim().Trim('"', "'", ' ', ';', ',')
                 $value = ($value -split '[#;]')[0]
                 # Cut at the next `, ` or `->` boundary -- common log noise
                 # like "key = value, message = ..." would otherwise capture
                 # the whole tail.
                 $value = ($value -split ',\s+|\s+->\s+|\s+message\s*=', 2)[0]
+            }
+
+            # php_array_password captures the value literal itself (group 3), so
+            # read it straight off the match we already have -- no second regex
+            # pass, and more precise than the last-quoted-literal fallback below,
+            # which would latch onto a trailing quoted comment
+            # (  $sql['password'] = 'RealPw';  // was 'changeme'  ). Mirrors the
+            # bash engine, which extracts BASH_REMATCH[3] for this same label.
+            if ($p.Label -eq 'php_array_password' -and $m.Groups.Count -ge 4) {
+                $value = $m.Groups[3].Value
             }
 
             # PHP 'key' => 'value' / define('KEY','value') / new mysqli(...,'pw')
@@ -1685,7 +1782,13 @@ function Write-RegistrySessionReview { param([string]$Root, [string]$Tool)
                 # Light sanitise + generous cap so the WHOLE command is visible
                 # (well past the 140-char preview cap) without flooding on a
                 # pathological multi-KB value.
-                $show = ($data -replace '[\r\n\t]+', ' ')
+                # Strip ALL C0/DEL control bytes, not just \r\n\t: registry value
+                # data is attacker-influencable content that gets echoed to the
+                # operator's terminal and into the -OutputFile log, so an embedded
+                # ESC would otherwise smuggle an ANSI sequence through. Format-Preview
+                # already enforces this for scanned file content; registry data was
+                # the one path that bypassed it.
+                $show = ($data -replace '[\x00-\x1F\x7F]+', ' ')
                 if ($show.Length -gt 600) { $show = $show.Substring(0, 600) + '...(truncated)' }
                 if ($prop.Name -match '(?i)(password|passwd|pwd|passphrase|secret|cred)') {
                     $secrets += "$($prop.Name)=$show"            # name looks secret
@@ -1695,7 +1798,9 @@ function Write-RegistrySessionReview { param([string]$Root, [string]$Tool)
                     $review  += "$($prop.Name)=$show"            # stored command -> manual review
                 }
             }
-            $base = (@("${Tool}[$sess]") + $ident) -join '  '
+            # Same control-byte guard as $show: the session name and identity fields
+            # are registry-supplied strings that reach the console and the log.
+            $base = ((@("${Tool}[$sess]") + $ident) -join '  ') -replace '[\x00-\x1F\x7F]+', ' '
             if ($secrets.Count -gt 0) {
                 # Bypass regex/FP filter entirely -- dump the raw stored value(s).
                 Add-Finding -Bucket High -Label "$Tool/stored_session_secret" `
@@ -1883,7 +1988,12 @@ function Test-WinSCPSessions {
     foreach ($d in @($env:APPDATA, $env:LOCALAPPDATA, $env:USERPROFILE)) {
         if (-not $d) { continue }
         try {
-            Get-ChildItem -LiteralPath $d -Recurse -Force -Filter 'WinSCP.ini' -ErrorAction SilentlyContinue |
+            # -Depth bounds traversal so a directory-junction cycle under a user
+            # profile cannot hang the scan (PS 5.1 -Recurse follows junctions), the
+            # same guard Test-RDPSavedSessions / Test-RemoteAccessManagers use. This
+            # walk starts at $env:USERPROFILE, so it has the identical exposure;
+            # WinSCP.ini lives ~2 levels down, well inside the bound.
+            Get-ChildItem -LiteralPath $d -Recurse -Depth 12 -Force -Filter 'WinSCP.ini' -ErrorAction SilentlyContinue |
                 Select-Object -First 5 |
                 ForEach-Object {
                     Add-Interesting -Category 'winscp_ini' -Path $_.FullName
@@ -2504,7 +2614,9 @@ function Get-WalkedFiles { param([string[]]$Paths)
         try {
             foreach ($info in (New-Object System.IO.DirectoryInfo $current).EnumerateFileSystemInfos()) {
                 if ($info -is [System.IO.DirectoryInfo]) {
-                    if (-not (Test-DirectoryExcluded -DirectoryPath $info.FullName)) { $stack.Push($info.FullName) }
+                    # Attributes are already populated from the enumeration's find-data;
+                    # pass them so Test-DirectoryExcluded does not re-stat the directory.
+                    if (-not (Test-DirectoryExcluded -DirectoryPath $info.FullName -KnownAttributes $info.Attributes)) { $stack.Push($info.FullName) }
                 } else {
                     $result.Add([PSCustomObject]@{
                         Path = $info.FullName; Name = $info.Name.ToLowerInvariant()
@@ -2650,7 +2762,16 @@ function Invoke-UserPathScan { param($Files)
                            -CurrentOperation $cur `
                            -PercentComplete ([Math]::Min(100, ($i * 100 / $total)))
         }
-        Invoke-ScanFile -FullPath $f.Path -SourceLabel 'content' -KnownSize $f.Size
+        # Per-file error isolation: a single pathological file (OOM decoding a huge
+        # line under -NoSizeLimit, a transient I/O fault, a device that stops
+        # responding mid-read) must not abort the remaining candidates. Stage 1
+        # already isolates its substages this way; Stage 5 is the longer-running
+        # stage, so losing the tail of a C:\ sweep to one bad file is worse.
+        try {
+            Invoke-ScanFile -FullPath $f.Path -SourceLabel 'content' -KnownSize $f.Size
+        } catch {
+            Add-Skipped -Path $f.Path -Reason ('scan error: ' + $_.Exception.Message)
+        }
     }
     Write-Progress -Activity "Scanning files for credentials" -Completed
 }
@@ -2826,6 +2947,15 @@ function Invoke-Main {
     if ($script:UserExcludePaths.Count -gt 0) {
         Write-Info ("User exclusions ($($script:CW){0}$($script:CNC)) - applied to stages 2-5 only:" -f $script:UserExcludePaths.Count)
         foreach ($p in $script:UserExcludePaths) {
+            Write-Host ("       $($script:CD)- {0}$($script:CNC)" -f $p)
+        }
+    }
+
+    # Built-in excludes that a requested -Path sits inside are disabled rather than
+    # silently truncating that subtree -- say so, since it changes what gets walked.
+    if ($script:DisabledExcludePrefixes.Count -gt 0) {
+        Write-Info ("Built-in exclusion(s) disabled ($($script:CW){0}$($script:CNC)) - a requested -Path lies inside them:" -f $script:DisabledExcludePrefixes.Count)
+        foreach ($p in $script:DisabledExcludePrefixes) {
             Write-Host ("       $($script:CD)- {0}$($script:CNC)" -f $p)
         }
     }
