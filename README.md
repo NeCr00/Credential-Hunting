@@ -4,7 +4,7 @@
 
 # CredsHunter
 
-**Find credentials that can actually be reused for lateral movement or privilege escalation — without drowning in cloud-token noise.**
+**Find credentials that can actually be reused for lateral movement or privilege escalation.**
 
 <br>
 
@@ -27,7 +27,6 @@ It searches Linux and Windows hosts for credential material that is realisticall
 
 The project deliberately **does not target cloud / SaaS access tokens** such as JWTs, AWS access keys, GitHub tokens, Slack tokens, or generic API keys. Those artifacts frequently create noise during internal assessments and are usually less useful for host-to-host lateral movement.
 
-> **Two siblings, one behavior:** `credshunter.sh` for Linux and `credshunter.ps1` for Windows.
 
 ### Design goals
 
