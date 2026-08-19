@@ -13,11 +13,10 @@
 ![version](https://img.shields.io/badge/version-2.4.0-2dd4bf?style=flat-square)
 ![bash](https://img.shields.io/badge/bash-4%2B-2b3137?style=flat-square&logo=gnubash&logoColor=white)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-2b3137?style=flat-square&logo=powershell&logoColor=white)
-![authorized use only](https://img.shields.io/badge/use-authorized%20only-f85149?style=flat-square)
 
 </div>
 
----
+
 
 ## Overview
 
@@ -37,7 +36,6 @@ The project deliberately **does not target cloud / SaaS access tokens** such as 
 - **Cross-platform** — matching Linux and Windows workflows.
 - **Operator-friendly** — live findings, grouped severity tiers, plain-text logging, stage controls, and clean interruption handling.
 
----
 
 ## How it works
 
